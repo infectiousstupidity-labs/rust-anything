@@ -297,7 +297,7 @@ The stdio MCP server enforces an independent, **restricted-by-default** policy.
 The allowed filesystem root is the MCP process's working directory unless
 `--root` explicitly grants one or more other directories. An implicit root
 of the home directory or filesystem root is refused as too broad. It resolves symlinks,
-checks output destinations and manifest-derived paths, and rejects traversal.
+checks output destinations, bridge-manifest and saved front-door paths, and rejects traversal.
 A tool request cannot change these server-side grants.
 
 ~~~sh

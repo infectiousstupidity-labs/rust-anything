@@ -45,7 +45,8 @@ root, in which case startup refuses to guess); repeatable `--root` arguments
 grant additional canonical directories. Direct `root`, `repo`, `crate`, `out`, `inputs`,
 `module`, `resolve_from` and `isolate_ro` path arguments cannot escape
 these roots (including via symlinks or parent traversal). Known generated
-output trees and manifest-resolved roots/source paths are also checked.
+output trees, bridge-manifest roots/source files, and saved front-door wired
+crate/shadow paths are also checked.
 
 Every MCP tool declares its read/write, process execution and destructive
 effects in descriptions, annotations and result metadata. Only `analyze`

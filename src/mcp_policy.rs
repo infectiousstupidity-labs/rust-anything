@@ -198,6 +198,12 @@ impl McpPolicy {
                 _ => {}
             }
         }
+        if matches!(
+            name,
+            "app_replay" | "app_front_door" | "app_wire" | "app_lift"
+        ) {
+            self.front_door_state(&main)?;
+        }
         if key == "crate" {
             self.manifest(&main)?;
             if action.write {
@@ -330,6 +336,33 @@ impl McpPolicy {
                 } else if kind.is_dir() {
                     pending.push_back(entry.path());
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// Saved front-door state also carries crate paths that may be dereferenced
+    /// or copied by wire/lift, independent of the direct MCP request.
+    fn front_door_state(&self, repo: &Path) -> Result<()> {
+        let app_dir = repo.join(crate::front_door::APP_DIR);
+        let config = app_dir.join(crate::front_door::STATE_FILE);
+        if !config.exists() && !config.is_symlink() {
+            return Ok(());
+        }
+        self.path(&config, "front-door state", true)?;
+        let state = crate::front_door::State::load(repo)?;
+        for unit in &state.units {
+            ensure!(
+                !unit.crate_name.is_empty()
+                    && unit
+                        .crate_name
+                        .bytes()
+                        .all(|c| c.is_ascii_alphanumeric() || c == b'_' || c == b'-'),
+                "front-door unit crate_name must be a safe ASCII crate identifier"
+            );
+            self.path(&app_dir.join(&unit.path), "front-door wired crate", true)?;
+            if let Some(shadow) = &unit.shadow {
+                self.path(Path::new(shadow), "front-door shadow", true)?;
             }
         }
         Ok(())
@@ -482,6 +515,54 @@ mod tests {
             assert!(policy.authorize(tool, &arguments).is_ok(), "{tool}");
         }
         std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn front_door_state_paths_cannot_escape_the_workspace() {
+        let root = sandbox("front-door");
+        let other = sandbox("front-door-external");
+        let state = root.join(crate::front_door::APP_DIR);
+        std::fs::create_dir_all(&state).unwrap();
+        let policy = McpPolicy::new(&[root.clone()], true, true, false).unwrap();
+        std::fs::write(
+            state.join(crate::front_door::STATE_FILE),
+            serde_json::json!({
+                "schema": "rust-anything/front-door@1",
+                "name": "test",
+                "commands": [],
+                "units": [{
+                    "name":"unit",
+                    "crate":"unit",
+                    "path":other,
+                    "commands":[],
+                    "switch":"RUST_ANYTHING_UNIT_UNIT"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(policy.authorize("app_lift", &json!({"repo":root})).is_err());
+
+        std::fs::write(
+            state.join(crate::front_door::STATE_FILE),
+            serde_json::json!({
+                "schema": "rust-anything/front-door@1",
+                "name": "test",
+                "commands": [],
+                "units": [{
+                    "name":"unit",
+                    "crate":"unit",
+                    "path":"../unit",
+                    "commands":[],
+                    "switch":"RUST_ANYTHING_UNIT_UNIT"
+                }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        assert!(policy.authorize("app_lift", &json!({"repo":root})).is_ok());
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(other).unwrap();
     }
 
     #[test]
