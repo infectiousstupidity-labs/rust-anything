@@ -37,6 +37,7 @@ pub mod lift;
 pub mod mcp;
 pub mod profile;
 pub mod recording;
+pub mod resource_limits;
 pub mod report;
 pub mod risks;
 pub mod setup;

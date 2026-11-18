@@ -246,7 +246,13 @@ struct Server {
 }
 
 impl Server {
-    fn start(command: &[String], repo: &Path, port: u16, isolation: &Isolation) -> Result<Server> {
+    fn start(
+        command: &[String],
+        repo: &Path,
+        port: u16,
+        isolation: &Isolation,
+        startup_timeout: Duration,
+    ) -> Result<Server> {
         let dir = app::temp_dir("server")?;
         let words: Vec<String> = command
             .iter()
@@ -266,13 +272,18 @@ impl Server {
                 .env(app::FALLBACK_ENV, &log);
             cmd
         };
-        let mut child = cmd
-            .stdin(Stdio::null())
+        let mut cmd = crate::resource_limits::bound_memory(
+            cmd,
+            crate::resource_limits::memory_mib()?,
+            isolation.enabled,
+        )?;
+        cmd.stdin(Stdio::null())
             .stdout(std::fs::File::create(dir.join("stdout"))?)
-            .stderr(std::fs::File::create(dir.join("stderr"))?)
-            .spawn()
+            .stderr(std::fs::File::create(dir.join("stderr"))?);
+        crate::resource_limits::configure_tree(&mut cmd);
+        let mut child = cmd.spawn()
             .with_context(|| format!("starting `{}`", command.join(" ")))?;
-        let deadline = Instant::now() + READY;
+        let deadline = Instant::now() + READY.min(startup_timeout);
         loop {
             if TcpStream::connect_timeout(&local(port), Duration::from_millis(200)).is_ok() {
                 break;
@@ -280,13 +291,15 @@ impl Server {
             let failure = if let Some(status) = child.try_wait()? {
                 Some(format!("exited ({status}) before listening"))
             } else if Instant::now() > deadline {
-                Some(format!("did not listen within {}s", READY.as_secs()))
+                Some(format!(
+                    "did not listen within {}s",
+                    READY.min(startup_timeout).as_secs_f64()
+                ))
             } else {
                 None
             };
             if let Some(failure) = failure {
-                let _ = child.kill();
-                let _ = child.wait();
+                crate::resource_limits::terminate_tree(&mut child);
                 let stderr = std::fs::read_to_string(dir.join("stderr")).unwrap_or_default();
                 let tail: Vec<&str> = stderr.lines().rev().take(15).collect();
                 let tail: Vec<&str> = tail.into_iter().rev().collect();
@@ -325,8 +338,8 @@ impl Server {
         self.stopped = true;
         #[cfg(unix)]
         {
-            let _ = Command::new("kill")
-                .args(["-TERM", &self.child.id().to_string()])
+            let _ = Command::new("/bin/kill")
+                .args(["-TERM", "--", &format!("-{}", self.child.id())])
                 .stderr(Stdio::null())
                 .status();
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -337,8 +350,7 @@ impl Server {
                 std::thread::sleep(Duration::from_millis(20));
             }
         }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        crate::resource_limits::terminate_tree(&mut self.child);
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -360,11 +372,19 @@ fn run_all(
     timeout: Duration,
     isolation: &Isolation,
 ) -> Result<Vec<Answer>> {
-    let mut server = Server::start(command, repo, port, isolation)?;
+    let limits = crate::resource_limits::RecordingLimits::from_env()?;
+    let began = Instant::now();
+    let mut server = Server::start(command, repo, port, isolation, limits.startup.min(limits.overall))?;
     let mut out = Vec::new();
     for req in reqs {
+        let remaining = limits.overall.saturating_sub(began.elapsed());
+        if remaining.is_zero() {
+            out.push((Err("overall_timeout: HTTP recording/replay budget exceeded".into()), None));
+            continue;
+        }
         let before = server.fallbacks().unwrap_or(0);
-        let resp = send(server.port, req, timeout).map_err(|e| format!("{e:#}"));
+        let resp = send(server.port, req, timeout.min(remaining))
+            .map_err(|e| format!("{e:#}"));
         let fell_back = server.fallbacks().map(|after| after > before);
         out.push((resp, fell_back));
     }

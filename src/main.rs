@@ -550,13 +550,17 @@ fn run() -> Result<ExitCode> {
             }
             if !outcome.timed_out.is_empty() {
                 say!(
-                    "Left out {} input(s) the original ran too long on (over the per-case limit, \
-                     RUST_ANYTHING_CASE_TIMEOUT seconds, 10 by default). The original does this \
-                     itself, so the port need not match it there:",
+                    "Skipped {} input(s) due to recording resource limits:",
                     outcome.timed_out.len()
                 );
                 for c in &outcome.timed_out {
-                    say!("  {}({})", c["fn"].as_str().unwrap_or("?"), c["args"]);
+                    say!(
+                        "  #{} {}({}) — {}",
+                        c["case_index"],
+                        c["fn"].as_str().or_else(|| c["class"].as_str()).unwrap_or("?"),
+                        c["args"],
+                        c["reason"].as_str().unwrap_or("unknown")
+                    );
                 }
             }
         }

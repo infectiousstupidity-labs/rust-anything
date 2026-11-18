@@ -70,6 +70,22 @@ and compromised system runtime binaries remain risks. Build steps, unrelated
 tool commands and network-enabled servers are outside this mode's narrower
 guarantee. Use a dedicated VM for hostile workloads that need stronger isolation.
 
+## Resource limits during recording
+
+Drivers have a startup/no-progress timeout (15 seconds), a per-case timeout
+(10 seconds), and an overall recording deadline (600 seconds). They terminate
+the process tree and preserve completed records, listing skipped case indices
+and reasons. `RUST_ANYTHING_MEMORY_MIB` defaults to 8192 MiB and enforces an
+inherited Linux RLIMIT_AS (virtual address space, per process) during recording,
+app replay, and HTTP server execution. This is **not** a cgroup aggregate RSS
+or fork-bomb limit. Override only in an appropriately resourced host/container.
+
+On macOS and Windows, process trees are stopped best-effort on timeout, but
+there is **no hard RAM limit**. Use external VM/container resource limits for
+untrusted applications on those platforms; the built-in watchdog does not
+prevent a rapid memory spike. The recording limits do not protect unrelated
+build/profile/gate commands and are not an execution sandbox.
+
 ## Documented HTTP curl examples
 
 When recording HTTP examples with `app record --http`, curl `@file` request bodies

@@ -108,7 +108,7 @@ fn tools() -> Value {
         },
         {
             "name": "record",
-            "description": "TRUSTED HOST EXECUTION (not sandboxed): run the original functions on generated edge-case inputs (non-ASCII, emoji, -0, NaN, ...) plus optional extra inputs, and save the results as cases.jsonl: the behavior the port must match.",
+            "description": "TRUSTED HOST EXECUTION (not sandboxed): run original functions on edge-case inputs and save cases.jsonl. Watchdogs: RUST_ANYTHING_STARTUP_TIMEOUT (seconds, default 15), RUST_ANYTHING_CASE_TIMEOUT (seconds, default 10), RUST_ANYTHING_RECORD_TIMEOUT (seconds, default 600), and RUST_ANYTHING_MEMORY_MIB (Linux per-process address space, default 8192 MiB). Skipped cases include reason and index.",
             "inputSchema": { "type": "object", "properties": {
                 "crate": crate_dir,
                 "count": { "type": "integer", "description": "Generated cases per function (default 200)." },

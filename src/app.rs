@@ -219,6 +219,16 @@ struct Run {
 }
 
 impl Run {
+    fn deadline_exceeded() -> Self {
+        Self {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            status: Status::Timeout,
+            files: BTreeMap::new(),
+            fallback: None,
+        }
+    }
+
     fn written(&self, case: &Case) -> BTreeMap<PathBuf, Vec<u8>> {
         self.files
             .iter()
@@ -440,15 +450,16 @@ fn run_in(
         cmd.envs(&case.env).env(FALLBACK_ENV, &log);
         cmd
     };
-    cmd.current_dir(&work)
-        .stdin(Stdio::piped())
+    cmd.current_dir(&work);
+    let mut cmd = crate::resource_limits::bound_memory(
+        cmd,
+        crate::resource_limits::memory_mib()?,
+        isolation.enabled || !case.inherit_env,
+    )?;
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt as _;
-        cmd.process_group(0);
-    }
+    crate::resource_limits::configure_tree(&mut cmd);
     let mut child = cmd
         .spawn()
         .with_context(|| format!("running `{}`", command.join(" ")))?;
@@ -484,19 +495,13 @@ fn run_in(
             }
         }
         if start.elapsed() > timeout {
-            #[cfg(unix)]
-            {
-                let _ = Command::new("/bin/kill")
-                    .args(["-KILL", "--", &format!("-{}", child.id())])
-                    .stderr(Stdio::null())
-                    .status();
-            }
-            let _ = child.kill();
-            let _ = child.wait();
+            crate::resource_limits::terminate_tree(&mut child);
             break Status::Timeout;
         }
         std::thread::sleep(Duration::from_millis(2));
     };
+    // A completed parent may still have descendants holding stdout/stderr.
+    crate::resource_limits::terminate_tree(&mut child);
     let _ = writer.join();
     let stdout = out_reader.join().unwrap_or_default();
     let stderr = err_reader.join().unwrap_or_default();
@@ -1600,9 +1605,26 @@ pub fn record_with_isolation(opts: &RecordOptions, isolation: &Isolation) -> Res
     }
 
     let timeout = Duration::from_secs(config.timeout_secs);
+    let overall = crate::resource_limits::RecordingLimits::from_env()?.overall;
+    let recording_started = Instant::now();
     let runs = par_map(&planned, |(_, case)| -> Result<(Run, Run)> {
-        let one = run_case_isolated(&config.run, &repo, case, timeout, isolation)?;
-        let two = run_case_isolated(&config.run, &repo, case, timeout, isolation)?;
+        let remaining = overall.saturating_sub(recording_started.elapsed());
+        if remaining.is_zero() {
+            return Ok((Run::deadline_exceeded(), Run::deadline_exceeded()));
+        }
+        let one = run_case_isolated(
+            &config.run,
+            &repo,
+            case,
+            timeout.min(remaining),
+            isolation,
+        )?;
+        let remaining = overall.saturating_sub(recording_started.elapsed());
+        let two = if remaining.is_zero() {
+            Run::deadline_exceeded()
+        } else {
+            run_case_isolated(&config.run, &repo, case, timeout.min(remaining), isolation)?
+        };
         Ok((one, two))
     });
     let dir = cases_dir(&repo);
@@ -2206,11 +2228,30 @@ pub fn replay_with_isolation(opts: &ReplayOptions, isolation: &Isolation) -> Res
         );
     }
     let specs = only_case(load_specs(&dir)?, opts.case, |s| &s.name)?;
+    let overall = crate::resource_limits::RecordingLimits::from_env()?.overall;
+    let replay_started = Instant::now();
     let results = par_map(&specs, |spec| {
         if matches!(spec.status, Expect::Skip) {
             return Ok((Vec::new(), None));
         }
-        check(&norm, &command, &repo, spec, timeout, isolation)
+        let remaining = overall.saturating_sub(replay_started.elapsed());
+        if remaining.is_zero() {
+            return Ok((
+                vec![Problem {
+                    field: "run".to_string(),
+                    detail: "overall_timeout: replay budget exceeded\n".to_string(),
+                }],
+                None,
+            ));
+        }
+        check(
+            &norm,
+            &command,
+            &repo,
+            spec,
+            timeout.min(remaining),
+            isolation,
+        )
     });
     let mut outcome = ReplayOutcome {
         build: command.clone(),

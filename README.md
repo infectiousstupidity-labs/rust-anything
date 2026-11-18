@@ -335,6 +335,39 @@ untrusted projects in an external VM/container. The isolation flag does not cove
 `record`/`diff`/`profile`/`gate` loop or any build/front-door/wire/lift command.
 See [SECURITY.md](./SECURITY.md) for boundaries and limitations.
 
+### Recording resource limits
+
+Recording has finite watchdog deadlines even if a driver never emits a progress index.
+Environment overrides (all are validated; invalid values are rejected):
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `RUST_ANYTHING_STARTUP_TIMEOUT` | 15 | Seconds allowed before the driver's first progress index (per driver launch) |
+| `RUST_ANYTHING_CASE_TIMEOUT` | 10 | Seconds allowed for one reported case |
+| `RUST_ANYTHING_RECORD_TIMEOUT` | 600 | Total seconds for all recording attempts, including restarts |
+| `RUST_ANYTHING_MEMORY_MIB` | 8192 | Linux per-process virtual address-space limit in MiB (128–65536 allowed) |
+
+Timeouts accept finite numbers from 0.05 to 86400 seconds. Completed JSONL cases
+are retained and unrecorded cases are listed with their original index and a
+specific reason (`startup_timeout`, `case_timeout`, `overall_timeout` or
+`memory_limit`). Unexpected driver failures also leave already recorded cases
+on disk. Memory exhaustion can cause the original process to fail or emit a
+recorded error rather than produce a skipped case.
+
+On Linux the memory ceiling is enforced before executing the original driver or
+app using a shell `ulimit -v` (RLIMIT_AS), inherited by descendants. It
+limits each process's **virtual address space**, not total resident memory across
+the whole process tree. Some runtimes (especially large JVM/Node apps) reserve
+much more address space than their actual RSS and may need a higher limit.
+For strict process-tree aggregate RAM limits, use cgroup v2 / container limits.
+
+On macOS and Windows, the watchdog still applies, and subprocess trees are
+terminated best-effort, but a hard memory ceiling is **not enforced** by this
+feature. Run untrusted workloads in a VM/container with RAM and PID limits.
+These controls do not turn trusted host execution into a secure sandbox.
+To constrain access to secrets or the network, use the opt-in Linux isolation
+mode described above or a separate VM.
+
 ### Servers
 
 The same commands prove HTTP servers. `--http` says the command starts a server; it takes its

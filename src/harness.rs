@@ -70,7 +70,7 @@ pub struct RecordOutcome {
     /// Functions in files that use regexes: their string parameters also got the regex traps.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub regex_functions: Vec<String>,
-    /// Inputs left out because the original ran past the per-case time limit on them.
+    /// Cases skipped by startup, per-case, overall, or memory limits (with reason and index).
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub timed_out: Vec<Value>,
 }
@@ -293,7 +293,12 @@ pub fn record(opts: &RecordOptions) -> Result<RecordOutcome> {
         regex_functions,
         timed_out: timed_out
             .iter()
-            .map(|c| serde_json::json!({ "fn": c["fn"].clone(), "args": c["args"].clone() }))
+            .map(|c| serde_json::json!({
+                "fn": c["fn"].clone(),
+                "args": c["args"].clone(),
+                "reason": c["reason"].clone(),
+                "case_index": c["case_index"].clone(),
+            }))
             .collect(),
     })
 }
@@ -1188,112 +1193,210 @@ fn run_node(node_args: &[String], script: &Path, args: &[&std::ffi::OsStr]) -> R
     )
 }
 
-/// How long one recorded case may run before the original is stopped on it:
-/// `RUST_ANYTHING_CASE_TIMEOUT` seconds, 10 by default.
-fn case_timeout() -> std::time::Duration {
-    let secs = std::env::var("RUST_ANYTHING_CASE_TIMEOUT")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|s| s.is_finite() && *s > 0.0)
-        .unwrap_or(10.0);
-    std::time::Duration::from_secs_f64(secs)
+/// Preserve completed case records and the exact reason every omitted input
+/// was skipped, including when a driver crashes during startup.
+fn save_recording(
+    out: &Path,
+    work: &Path,
+    recorded: &str,
+    skipped: &[Value],
+) -> Result<()> {
+    std::fs::write(out, recorded)?;
+    std::fs::write(work.join(TIMED_OUT), serde_json::to_string(skipped)?)?;
+    Ok(())
 }
 
-/// Runs a record driver over `cases` with a watchdog. The driver appends the index of each case
-/// it starts to `RUST_ANYTHING_PROGRESS` and flushes each recorded line. A case that runs past
-/// the time limit (an input that makes the original allocate or loop for ever) stops the driver;
-/// the lines recorded so far are kept, that input is left out, and the driver goes on with the
-/// rest. Returns the inputs left out.
+fn skipped_case(input: &Value, index: usize, reason: &str) -> Value {
+    let mut case = input.clone();
+    if let Some(fields) = case.as_object_mut() {
+        fields.insert("reason".into(), Value::String(reason.to_string()));
+        fields.insert("case_index".into(), serde_json::json!(index));
+    }
+    case
+}
+
+/// Run the recording driver with independent startup, per-case and total-run
+/// watchdogs. Completed JSONL lines survive every restart and unexpected exit.
 pub(crate) fn record_cases(
     cases: &[Value],
     work: &Path,
     out: &Path,
     what: &str,
+    command: impl FnMut(&Path, &Path) -> Result<Command>,
+) -> Result<Vec<Value>> {
+    record_cases_with_limits(
+        cases,
+        work,
+        out,
+        what,
+        command,
+        crate::resource_limits::RecordingLimits::from_env()?,
+    )
+}
+
+fn record_cases_with_limits(
+    cases: &[Value],
+    work: &Path,
+    out: &Path,
+    what: &str,
     mut command: impl FnMut(&Path, &Path) -> Result<Command>,
+    limits: crate::resource_limits::RecordingLimits,
 ) -> Result<Vec<Value>> {
     use std::process::Stdio;
     use std::time::Instant;
     std::fs::create_dir_all(work)?;
-    let timeout = case_timeout();
     let inputs = work.join("record-inputs.json");
     let part = work.join("record-part.jsonl");
     let progress = work.join("record-progress");
     let stderr_path = work.join("record-stderr");
     let mut recorded = String::new();
-    let mut timed_out = Vec::new();
+    let mut skipped = Vec::new();
+    let overall_start = Instant::now();
     let mut start = 0;
+    save_recording(out, work, &recorded, &skipped)?;
+
     while start < cases.len() {
+        if overall_start.elapsed() >= limits.overall {
+            skipped.extend(
+                cases[start..]
+                    .iter()
+                    .enumerate()
+                    .map(|(offset, case)| skipped_case(case, start + offset, "overall_timeout")),
+            );
+            break;
+        }
         std::fs::write(&inputs, serde_json::to_string(&cases[start..])?)?;
         std::fs::write(&progress, "")?;
         let _ = std::fs::remove_file(&part);
-        let mut cmd = command(&inputs, &part)?;
+        let mut cmd = crate::resource_limits::bound_memory(
+            command(&inputs, &part)?,
+            limits.memory_mib,
+            false,
+        )?;
         cmd.env("RUST_ANYTHING_PROGRESS", &progress)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&stderr_path)?);
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt as _;
-            cmd.process_group(0);
-        }
+        crate::resource_limits::configure_tree(&mut cmd);
         let mut child = cmd.spawn().with_context(|| format!("running {what}"))?;
+        let driver_start = Instant::now();
         let mut current: Option<(usize, Instant)> = None;
+        let mut stopped_for = None;
+
         let status = loop {
+            // Read progress *before* checking exit: fast drivers may finish
+            // between polls, and their last recorded index is still valid.
+            let latest = std::fs::read_to_string(&progress).ok().and_then(|text| {
+                text.lines()
+                    .last()
+                    .and_then(|line| line.trim().parse::<usize>().ok())
+            });
+            if let Some(index) = latest.filter(|index| *index < cases.len() - start)
+                && current.as_ref().is_none_or(|(previous, _)| *previous != index)
+            {
+                current = Some((index, Instant::now()));
+            }
             if let Some(status) = child.try_wait()? {
                 break Some(status);
             }
-            let started = std::fs::read_to_string(&progress).ok().and_then(|p| {
-                p.lines()
-                    .last()
-                    .and_then(|l| l.trim().parse::<usize>().ok())
-            });
-            match (started, current) {
-                (Some(i), Some((j, _))) if i == j => {}
-                (Some(i), _) => current = Some((i, Instant::now())),
-                (None, _) => {}
-            }
-            if let Some((_, since)) = current
-                && since.elapsed() > timeout
+            let reason = if overall_start.elapsed() >= limits.overall {
+                Some("overall_timeout")
+            } else if current.is_none() && driver_start.elapsed() >= limits.startup {
+                Some("startup_timeout")
+            } else if current
+                .as_ref()
+                .is_some_and(|(_, began)| began.elapsed() >= limits.case)
             {
-                #[cfg(unix)]
-                {
-                    let _ = Command::new("/bin/kill")
-                        .args(["-KILL", "--", &format!("-{}", child.id())])
-                        .stderr(Stdio::null())
-                        .status();
-                }
-                let _ = child.kill();
-                let _ = child.wait();
+                Some("case_timeout")
+            } else {
+                None
+            };
+            if let Some(reason) = reason {
+                stopped_for = Some(reason);
+                crate::resource_limits::terminate_tree(&mut child);
                 break None;
             }
             std::thread::sleep(std::time::Duration::from_millis(20));
         };
+        // A successful driver can leave children running. Reap those too.
+        if status.is_some() {
+            crate::resource_limits::terminate_tree(&mut child);
+        }
         let written = std::fs::read_to_string(&part).unwrap_or_default();
         let complete = written.rfind('\n').map_or("", |end| &written[..=end]);
         recorded.push_str(complete);
-        match (status, current) {
-            (Some(status), _) if status.success() => break,
-            (Some(status), _) => {
-                let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+        let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+
+        match status {
+            Some(status) if status.success() => {
+                if current.is_none() {
+                    skipped.extend(
+                        cases[start..].iter().enumerate().map(|(offset, case)| {
+                            skipped_case(case, start + offset, "driver_exited_without_progress")
+                        }),
+                    );
+                }
+                break;
+            }
+            Some(status)
+                if crate::resource_limits::likely_memory_exhaustion(&stderr, &status) =>
+            {
+                match current {
+                    Some((index, _)) => {
+                        skipped.push(skipped_case(
+                            &cases[start + index],
+                            start + index,
+                            "memory_limit",
+                        ));
+                        start += index + 1;
+                    }
+                    None => {
+                        skipped.extend(
+                            cases[start..].iter().enumerate().map(|(offset, case)| {
+                                skipped_case(case, start + offset, "memory_limit_before_progress")
+                            }),
+                        );
+                        break;
+                    }
+                }
+            }
+            Some(status) => {
+                save_recording(out, work, &recorded, &skipped)?;
                 let tail: Vec<&str> = stderr.lines().rev().take(25).collect();
-                bail!(
-                    "{what} failed ({status}):\n{}",
+                anyhow::bail!(
+                    "{what} failed ({status}); completed cases were saved to {}:\n{}",
+                    out.display(),
                     tail.into_iter().rev().collect::<Vec<_>>().join("\n")
                 );
             }
-            (None, Some((i, _))) => {
-                timed_out.push(cases[start + i].clone());
-                start += i + 1;
+            None => {
+                let reason = stopped_for.context("recording driver stopped without a reason")?;
+                if reason == "overall_timeout" || current.is_none() {
+                    let first = current.as_ref().map_or(start, |(index, _)| start + index);
+                    skipped.extend(
+                        cases[first..].iter().enumerate().map(|(offset, case)| {
+                            skipped_case(case, first + offset, reason)
+                        }),
+                    );
+                    break;
+                }
+                if let Some((index, _)) = current {
+                    skipped.push(skipped_case(
+                        &cases[start + index],
+                        start + index,
+                        reason,
+                    ));
+                    start += index + 1;
+                }
             }
-            (None, None) => unreachable!("the watchdog only stops a driver inside a case"),
         }
+        save_recording(out, work, &recorded, &skipped)?;
     }
-    std::fs::write(out, recorded)?;
-    std::fs::write(work.join(TIMED_OUT), serde_json::to_string(&timed_out)?)?;
-    Ok(timed_out)
+    save_recording(out, work, &recorded, &skipped)?;
+    Ok(skipped)
 }
 
-/// Inputs the last `record` left out because the original ran past the time limit on them.
+/// Reason-coded inputs skipped because of startup/per-case/overall deadlines or memory limits.
 pub(crate) const TIMED_OUT: &str = "timed-out.json";
 
 fn run(cmd: &mut Command, what: &str) -> Result<()> {
@@ -1809,6 +1912,272 @@ mod tests {
             uses_instanceof: false,
             ..Default::default()
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recorder_stops_before_first_progress_and_reports_every_unrecorded_case() {
+        use std::time::{Duration, Instant};
+
+        let dir = crate::app::temp_dir("recorder-startup-hang").unwrap();
+        let out = dir.join("cases.jsonl");
+        let cases = vec![
+            serde_json::json!({"fn":"one","args":[]}),
+            serde_json::json!({"fn":"two","args":[]}),
+        ];
+        let limits = crate::resource_limits::RecordingLimits {
+            case: Duration::from_secs(1),
+            startup: Duration::from_millis(180),
+            overall: Duration::from_secs(4),
+            memory_mib: 512,
+        };
+        let started = Instant::now();
+        let skipped = record_cases_with_limits(
+            &cases,
+            &dir,
+            &out,
+            "startup stall",
+            |_, _| {
+                let mut cmd = Command::new("/bin/sh");
+                cmd.args(["-c", "sleep 20"]);
+                Ok(cmd)
+            },
+            limits,
+        )
+        .unwrap();
+        assert!(started.elapsed() < Duration::from_secs(3));
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped.iter().all(|case| case["reason"] == "startup_timeout"));
+        assert_eq!(skipped[0]["case_index"], 0);
+        assert_eq!(skipped[1]["case_index"], 1);
+        assert_eq!(std::fs::read_to_string(&out).unwrap(), "");
+        assert_eq!(
+            serde_json::from_slice::<Vec<Value>>(
+                &std::fs::read(dir.join(TIMED_OUT)).unwrap()
+            )
+            .unwrap()
+            .len(),
+            2
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recorder_keeps_completed_cases_and_recovers_after_timeouts() {
+        use std::time::Duration;
+
+        let dir = crate::app::temp_dir("recorder-case-timeout").unwrap();
+        let script = dir.join("driver.py");
+        std::fs::write(
+            &script,
+            r#"import json, os, sys, time
+cases = json.load(open(sys.argv[1], encoding="utf-8"))
+for i, c in enumerate(cases):
+    with open(os.environ["RUST_ANYTHING_PROGRESS"], "a") as progress:
+        progress.write(str(i) + "\n")
+    if c["fn"] == "stall":
+        time.sleep(10)
+    with open(sys.argv[2], "a") as output:
+        output.write(json.dumps(c) + "\n")
+"#,
+        )
+        .unwrap();
+        let cases = ["first", "stall", "last"]
+            .map(|name| serde_json::json!({"fn":name,"args":[]}));
+        let out = dir.join("cases.jsonl");
+        let skipped = record_cases_with_limits(
+            &cases,
+            &dir,
+            &out,
+            "driver recovery",
+            |inputs, part| {
+                let mut cmd = Command::new("python3");
+                cmd.arg(&script).arg(inputs).arg(part);
+                Ok(cmd)
+            },
+            crate::resource_limits::RecordingLimits {
+                case: Duration::from_millis(350),
+                startup: Duration::from_secs(2),
+                overall: Duration::from_secs(5),
+                memory_mib: 512,
+            },
+        )
+        .unwrap();
+        let written = std::fs::read_to_string(&out).unwrap();
+        assert!(written.contains("\"fn\": \"first\""));
+        assert!(!written.contains("\"fn\": \"stall\""));
+        assert!(written.contains("\"fn\": \"last\""));
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0]["fn"], "stall");
+        assert_eq!(skipped[0]["reason"], "case_timeout");
+        assert_eq!(skipped[0]["case_index"], 1);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Intentionally allocates beyond the child process's RLIMIT_AS. Run only
+    /// in the dedicated Linux resource-limits CI job with an enforced 256 MiB
+    /// cap; the parent process never allocates the large buffer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "run in the Linux resource-limits CI job"]
+    fn recording_hard_memory_limit_is_enforced() {
+        use std::time::Duration;
+
+        let dir = crate::app::temp_dir("recorder-memory-limit").unwrap();
+        let script = dir.join("memory.py");
+        std::fs::write(
+            &script,
+            r#"import json, os, sys
+cases = json.load(open(sys.argv[1], encoding="utf-8"))
+for i, c in enumerate(cases):
+    with open(os.environ["RUST_ANYTHING_PROGRESS"], "a") as progress:
+        progress.write(str(i) + "\n")
+    if c["fn"] == "hog":
+        try:
+            huge = bytearray(768 * 1024 * 1024)
+        except MemoryError:
+            print("MemoryError: memory limit enforced", file=sys.stderr)
+            sys.exit(19)
+    with open(sys.argv[2], "a") as output:
+        output.write(json.dumps(c) + "\n")
+"#,
+        )
+        .unwrap();
+        let cases = ["hog", "recovered"]
+            .map(|name| serde_json::json!({"fn":name,"args":[]}));
+        let out = dir.join("cases.jsonl");
+        let skipped = record_cases_with_limits(
+            &cases,
+            &dir,
+            &out,
+            "controlled memory allocation",
+            |inputs, part| {
+                let mut cmd = Command::new("python3");
+                cmd.arg(&script).arg(inputs).arg(part);
+                Ok(cmd)
+            },
+            crate::resource_limits::RecordingLimits {
+                case: Duration::from_secs(2),
+                startup: Duration::from_secs(2),
+                overall: Duration::from_secs(5),
+                memory_mib: 256,
+            },
+        )
+        .unwrap();
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0]["reason"], "memory_limit");
+        assert_eq!(skipped[0]["fn"], "hog");
+        assert!(std::fs::read_to_string(&out).unwrap().contains("recovered"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recorder_enforces_overall_budget_for_remaining_inputs() {
+        use std::time::Duration;
+
+        let dir = crate::app::temp_dir("recorder-overall-budget").unwrap();
+        let cases = ["first", "second"]
+            .map(|name| serde_json::json!({"fn":name,"args":[]}));
+        let skipped = record_cases_with_limits(
+            &cases,
+            &dir,
+            &dir.join("cases.jsonl"),
+            "overall deadline",
+            |_, _| {
+                let mut cmd = Command::new("/bin/sh");
+                cmd.args(["-c", "sleep 10"]);
+                Ok(cmd)
+            },
+            crate::resource_limits::RecordingLimits {
+                case: Duration::from_secs(5),
+                startup: Duration::from_secs(5),
+                overall: Duration::from_millis(190),
+                memory_mib: 512,
+            },
+        )
+        .unwrap();
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped.iter().all(|case| case["reason"] == "overall_timeout"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recorder_kills_descendants_on_startup_timeout() {
+        use std::time::Duration;
+
+        let dir = crate::app::temp_dir("recorder-orphan").unwrap();
+        let marker = dir.join("orphan-wrote-marker");
+        let out = dir.join("cases.jsonl");
+        let skipped = record_cases_with_limits(
+            &[serde_json::json!({"fn":"orphan","args":[]})],
+            &dir,
+            &out,
+            "orphan watchdog",
+            |_, _| {
+                let mut cmd = Command::new("/bin/sh");
+                cmd.arg("-c").arg(format!(
+                    "(sleep 1; touch '{}') & sleep 10",
+                    marker.display()
+                ));
+                Ok(cmd)
+            },
+            crate::resource_limits::RecordingLimits {
+                case: Duration::from_secs(2),
+                startup: Duration::from_millis(180),
+                overall: Duration::from_secs(4),
+                memory_mib: 512,
+            },
+        )
+        .unwrap();
+        assert_eq!(skipped[0]["reason"], "startup_timeout");
+        std::thread::sleep(Duration::from_millis(1200));
+        assert!(!marker.exists(), "orphaned grandchild survived process-group kill");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn recorder_terminates_windows_subprocess_tree() {
+        use std::time::Duration;
+
+        let dir = crate::app::temp_dir("recorder-windows-orphan").unwrap();
+        let marker = dir.join("orphan-wrote-marker");
+        let script = r#"import subprocess, sys, time
+subprocess.Popen([
+    sys.executable, "-c",
+    "import sys, time; time.sleep(2); open(sys.argv[1], 'w').write('orphan')",
+    sys.argv[1],
+])
+time.sleep(15)
+"#;
+        let skipped = record_cases_with_limits(
+            &[serde_json::json!({"fn":"windows-orphan","args":[]})],
+            &dir,
+            &dir.join("cases.jsonl"),
+            "windows tree watchdog",
+            |_, _| {
+                let mut cmd = Command::new("python");
+                cmd.arg("-c").arg(script).arg(&marker);
+                Ok(cmd)
+            },
+            crate::resource_limits::RecordingLimits {
+                case: Duration::from_secs(5),
+                startup: Duration::from_millis(500),
+                overall: Duration::from_secs(5),
+                memory_mib: 512,
+            },
+        )
+        .unwrap();
+        assert_eq!(skipped[0]["reason"], "startup_timeout");
+        std::thread::sleep(Duration::from_millis(2500));
+        assert!(
+            !marker.exists(),
+            "taskkill /T /F left a child process running after parent timeout"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
