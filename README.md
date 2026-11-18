@@ -291,6 +291,50 @@ rust-anything app lift .
   files read at run time and asset folders not embedded, and replay on the pure binary. Only when
   all of it passes are the changes written back. The original is never touched.
 
+### Execution security: trusted vs isolated
+
+By default (or with `app record --trusted` / `app replay --trusted`),
+commands that run apps, tests, builds, or profilers execute on **your host with
+your user permissions**, including access to your home directory, agent credentials, network,
+and inherited environment. The temporary working directory in app recording/replay is **not**
+an OS security sandbox. This includes `record`, `profile`, `gate`, `app front-door`,
+`app wire`, and `app lift`, as well as the equivalent MCP tools. Use those only for trusted
+projects, or inside an external disposable VM/container.
+
+For an untrusted **CLI** app, the `app record` and `app replay` operations support an explicit
+Linux-only Bubblewrap boundary:
+
+~~~sh
+# Install bubblewrap through your distribution's package manager, then:
+rust-anything app record . --isolate -- python3 cli.py
+rust-anything app replay . --isolate
+
+# Optional: expose an explicitly chosen host directory as read-only.
+rust-anything app replay . --isolate --isolate-ro /data/fixtures
+
+# Optional: set a selected variable, not the host environment.
+rust-anything app record . --isolate --isolate-env APP_MODE=test -- python3 cli.py
+~~~
+
+This uses an isolated user/process/filesystem namespace, mounts only the project **read-only**
+at `/project`, gives each run its own writable `/session/cwd` and `/tmp`, clears inherited
+environment variables, hides the host home/agent credentials and unrelated projects, and
+disables network access by default. Operator-added read-only mounts appear as `/mnt/ro/0`,
+`/mnt/ro/1`, etc. Existing input cases can supply their explicitly recorded `env` entries.
+The project working directory is read-only in isolated mode; programs requiring write access to
+their source tree need adaptation or an external sandbox.
+
+HTTP servers need loopback access. `--isolate --isolate-network --http` and isolated HTTP
+replay with `--isolate-network` explicitly **share the host's entire network**, including
+outbound Internet access; this is not loopback-only filtering. Use network controls outside the
+process if you need restricted destinations.
+
+If Bubblewrap is absent, user namespaces are disabled, or the platform is not Linux,
+`--isolate` **fails instead of running on the host**. macOS and Windows users should run
+untrusted projects in an external VM/container. The isolation flag does not cover the unit
+`record`/`diff`/`profile`/`gate` loop or any build/front-door/wire/lift command.
+See [SECURITY.md](./SECURITY.md) for boundaries and limitations.
+
 ### Servers
 
 The same commands prove HTTP servers. `--http` says the command starts a server; it takes its

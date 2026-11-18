@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
-use crate::{analyze, app, bridge, front_door, gate, harness, lift, shadow};
+use crate::{analyze, app, bridge, front_door, gate, harness, isolation, lift, shadow};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
@@ -46,7 +46,7 @@ pub fn handle(request: &Value) -> Option<Value> {
             "serverInfo": { "name": "rust-anything", "version": env!("CARGO_PKG_VERSION") },
             "instructions": "Incremental TS/JS to Rust migration. Loop per unit: analyze -> bridge -> \
                 record -> (port src/port.rs) -> build -> diff -> shadow -> gate. Never mark a port done \
-                before gate passes.",
+                before gate passes. Execution uses host permissions unless explicitly                 isolated via app_record/app_replay on Linux.",
         }),
         "ping" => json!({}),
         "tools/list" => json!({ "tools": tools() }),
@@ -108,7 +108,7 @@ fn tools() -> Value {
         },
         {
             "name": "record",
-            "description": "Run the original functions on generated edge-case inputs (non-ASCII, emoji, -0, NaN, ...) plus optional extra inputs, and save the results as cases.jsonl: the behavior the port must match.",
+            "description": "TRUSTED HOST EXECUTION (not sandboxed): run the original functions on generated edge-case inputs (non-ASCII, emoji, -0, NaN, ...) plus optional extra inputs, and save the results as cases.jsonl: the behavior the port must match.",
             "inputSchema": { "type": "object", "properties": {
                 "crate": crate_dir,
                 "count": { "type": "integer", "description": "Generated cases per function (default 200)." },
@@ -121,12 +121,12 @@ fn tools() -> Value {
         },
         {
             "name": "build",
-            "description": "Build the crate: the napi-rs .node, wasm-bindgen output, Python extension or shared library.",
+            "description": "TRUSTED HOST EXECUTION (not sandboxed): build the crate (napi-rs .node, wasm-bindgen output, Python extension or shared library).",
             "inputSchema": { "type": "object", "properties": { "crate": crate_dir }, "required": ["crate"] },
         },
         {
             "name": "diff",
-            "description": "Replay cases.jsonl against the built Rust module and list mismatches.",
+            "description": "TRUSTED HOST EXECUTION (not sandboxed): replay cases.jsonl against the built Rust module and list mismatches.",
             "inputSchema": { "type": "object", "properties": {
                 "crate": crate_dir,
                 "ignore_key_order": { "type": "boolean" },
@@ -135,7 +135,7 @@ fn tools() -> Value {
         },
         {
             "name": "profile",
-            "description": "Run a real workload (a command: node or python3 script, `go test -bench`, java, ruby) under the language's profiler and rank the repository's hot functions by inclusive time, with their callers, call counts and advice: what to port together, and which loops to batch (`bridge` with `batch`). Profile before porting: leaf functions called one at a time are slower in Rust.",
+            "description": "TRUSTED HOST EXECUTION (not sandboxed): run a real workload (a command: node or python3 script, `go test -bench`, java, ruby) under the language's profiler and rank the repository's hot functions by inclusive time, with their callers, call counts and advice: what to port together, and which loops to batch (`bridge` with `batch`). Profile before porting: leaf functions called one at a time are slower in Rust.",
             "inputSchema": { "type": "object", "properties": {
                 "root": { "type": "string" },
                 "command": { "type": "array", "items": { "type": "string" }, "description": "The workload, run in root: [\"node\", \"bench.mjs\"]." },
@@ -144,7 +144,7 @@ fn tools() -> Value {
         },
         {
             "name": "bench",
-            "description": "Time the recorded cases on the original and on the built Rust module, bridge included; speedup below 1 means the port is slower as its callers call it. Returns the rows and a verdict with advice: ship, keep the slower functions, or port a bigger unit.",
+            "description": "TRUSTED HOST EXECUTION (not sandboxed): time the recorded cases on the original and on the built Rust module, bridge included; speedup below 1 means the port is slower as its callers call it. Returns the rows and a verdict with advice: ship, keep the slower functions, or port a bigger unit.",
             "inputSchema": { "type": "object", "properties": {
                 "crate": crate_dir,
                 "resolve_from": { "type": "string" },
@@ -157,12 +157,12 @@ fn tools() -> Value {
         },
         {
             "name": "gate",
-            "description": "Definition of done: fmt, clippy -D warnings, cargo test, unsafe with SAFETY comments only, no unimplemented functions, build, API present, recorded behavior matches.",
+            "description": "TRUSTED HOST EXECUTION (not sandboxed): definition of done: fmt, clippy -D warnings, cargo test, unsafe with SAFETY comments only, no unimplemented functions, build, API present, recorded behavior matches.",
             "inputSchema": { "type": "object", "properties": { "crate": crate_dir }, "required": ["crate"] },
         },
         {
             "name": "app_record",
-            "description": "Record the whole CLI app's behavior: run the original on its own documented examples, an inputs file and semantic traps (non-ASCII and emoji, negative division, overflow, float extremes, map order), twice each. What differs between runs is reported by kind in `noise`: values (now [..] wildcards), order (lines compared in any order) and lines (a ... that matches anything): show every one to the user. Cases are trycmd files in <repo>/rust/app-cases/ (argv, stdin, env, files in; stdout, stderr, exit code, files out).",
+            "description": "Record the whole CLI app's behavior (HOST EXECUTION BY DEFAULT; set isolate=true for Linux Bubblewrap): run the original on its own documented examples, an inputs file and semantic traps (non-ASCII and emoji, negative division, overflow, float extremes, map order), twice each. What differs between runs is reported by kind in `noise`: values (now [..] wildcards), order (lines compared in any order) and lines (a ... that matches anything): show every one to the user. Cases are trycmd files in <repo>/rust/app-cases/ (argv, stdin, env, files in; stdout, stderr, exit code, files out).",
             "inputSchema": { "type": "object", "properties": {
                 "repo": { "type": "string", "description": "Repository root." },
                 "run": { "type": "array", "items": { "type": "string" }, "description": "Command that runs the original, paths relative to repo: [\"python3\", \"cli.py\"]. Optional after the first record." },
@@ -173,21 +173,29 @@ fn tools() -> Value {
                 "http": { "type": "boolean", "description": "The app is a server: `run` starts it (it takes its port from PORT or {port}); cases are requests from curl lines in its docs, `inputs` ({\"name\", \"method\", \"path\", \"headers\", \"body\"}) and traps." },
                 "port": { "type": "integer", "description": "A port the server always listens on (implies http)." },
                 "float_tolerance": { "type": "number", "description": "Numeric output: numbers match when they differ by at most this times the larger magnitude (absolute below 1), e.g. 1e-9. Saved with the cases; 0 removes it." },
+                "isolate": { "type": "boolean", "description": "Use Bubblewrap isolation (Linux only; fails closed if unavailable). Trusted host execution by default." },
+                "isolate_network": { "type": "boolean", "description": "Share full host networking in isolated mode, required for HTTP; disabled by default." },
+                "isolate_ro": { "type": "array", "items": { "type": "string" }, "description": "Explicit read-only host directories exposed at /mnt/ro/0, /mnt/ro/1, etc. (isolated mode only)." },
+                "isolate_env": { "type": "array", "items": { "type": "string" }, "description": "Explicit NAME=VALUE environment entries (isolated mode only). No inherited host environment." },
             }, "required": ["repo"] },
         },
         {
             "name": "app_replay",
-            "description": "Replay <repo>/rust/app-cases/ against a build (the original, the front door, the final Rust binary): passed/total, fallback rate when the build reports it, and a report with a diff per failing case (rust/app-cases/replay-report.md).",
+            "description": "Replay <repo>/rust/app-cases/ against a build (the original, front door, or final Rust binary). HOST EXECUTION BY DEFAULT; set isolate=true for Linux Bubblewrap. Reports passed/total, fallback rate and a diff per failing case (rust/app-cases/replay-report.md).",
             "inputSchema": { "type": "object", "properties": {
                 "repo": { "type": "string", "description": "Repository root." },
                 "build": { "type": "string", "description": "Command line of the build to test; the original when omitted." },
                 "port": { "type": "integer", "description": "Servers: the port the build always listens on; otherwise it gets a free one through PORT and {port}." },
                 "case": { "type": "string", "description": "Replay only this case, by the name the report gives it (a library: only this unit): the fast loop for fixing one mismatch." },
+                "isolate": { "type": "boolean", "description": "Use Bubblewrap isolation (Linux only; fails closed if unavailable). Trusted host execution by default." },
+                "isolate_network": { "type": "boolean", "description": "Share full host networking in isolated mode, required for HTTP; disabled by default." },
+                "isolate_ro": { "type": "array", "items": { "type": "string" }, "description": "Explicit read-only host directories exposed at /mnt/ro/0, /mnt/ro/1, etc. (isolated mode only)." },
+                "isolate_env": { "type": "array", "items": { "type": "string" }, "description": "Explicit NAME=VALUE environment entries (isolated mode only). No inherited host environment." },
             }, "required": ["repo"] },
         },
         {
             "name": "app_front_door",
-            "description": "Scaffold <repo>/rust/app, the Rust binary that owns the CLI's entry point: a clap parser for the recorded commands and flags, every command running the original with the same argv, stdin and env (each fallback counted). For a server: an axum app that starts the original on a port of its own and proxies every route no unit answers. Builds it and replays the cases: 100% passed at 100% fallback. Needs app_record first; never overwrites rust/app.",
+            "description": "TRUSTED HOST EXECUTION (not sandboxed): scaffold <repo>/rust/app, the Rust binary that owns the CLI's entry point: a clap parser for the recorded commands and flags, every command running the original with the same argv, stdin and env (each fallback counted). For a server: an axum app that starts the original on a port of its own and proxies every route no unit answers. Builds it and replays the cases: 100% passed at 100% fallback. Needs app_record first; never overwrites rust/app.",
             "inputSchema": { "type": "object", "properties": {
                 "repo": { "type": "string", "description": "Repository root." },
                 "check": { "type": "boolean", "description": "Build and replay (default true)." },
@@ -196,7 +204,7 @@ fn tools() -> Value {
         },
         {
             "name": "app_wire",
-            "description": "After a unit passes gate, hand its commands to its port.rs: adds the unit crate to rust/app as a library, writes a glue stub (src/units/<unit>.rs, yours to write: parse args, call <crate>::port, print what the original prints), regenerates the routing with a kill switch RUST_ANYTHING_UNIT_<NAME>=original, then builds and replays. Run it again after writing the glue: 100% passed and a lower fallback rate.",
+            "description": "TRUSTED HOST EXECUTION (not sandboxed): after a unit passes gate, hand its commands to its port.rs: adds the unit crate to rust/app as a library, writes a glue stub (src/units/<unit>.rs, yours to write: parse args, call <crate>::port, print what the original prints), regenerates the routing with a kill switch RUST_ANYTHING_UNIT_<NAME>=original, then builds and replays. Run it again after writing the glue: 100% passed and a lower fallback rate.",
             "inputSchema": { "type": "object", "properties": {
                 "repo": { "type": "string", "description": "Repository root." },
                 "unit": { "type": "string", "description": "Unit crate folder, its name under rust/, or the unit id it was bridged from." },
@@ -208,7 +216,7 @@ fn tools() -> Value {
         },
         {
             "name": "app_lift",
-            "description": "Make rust/app a pure Rust app. Refuses (and lists every blocker) unless replay passes with fallback rate 0 and every unit passes gate. Then, on a copy first: removes the fallback and kill switches, turns each unit into a plain library (no cdylib, bindings or generated wrappers), adds a trycmd test running rust/app-cases on cargo test, checks fmt/clippy/tests, DECISIONS.md targets and assets, and replays the pure binary. Never touches the original.",
+            "description": "TRUSTED HOST EXECUTION (not sandboxed): make rust/app a pure Rust app. Refuses (and lists every blocker) unless replay passes with fallback rate 0 and every unit passes gate. Then, on a copy first: removes the fallback and kill switches, turns each unit into a plain library (no cdylib, bindings or generated wrappers), adds a trycmd test running rust/app-cases on cargo test, checks fmt/clippy/tests, DECISIONS.md targets and assets, and replays the pure binary. Never touches the original.",
             "inputSchema": { "type": "object", "properties": {
                 "repo": { "type": "string", "description": "Repository root." },
             }, "required": ["repo"] },
@@ -358,28 +366,46 @@ fn call(name: &str, args: &Value) -> Result<Value> {
         "app_record" => {
             let repo = path("repo")?;
             let inputs = opt_path("inputs");
-            serde_json::to_value(app::record(&app::RecordOptions {
-                repo: &repo,
-                run: &strings("run"),
-                inputs: inputs.as_deref(),
-                normalize: &strings("normalize"),
-                name: args["name"].as_str(),
-                traps: args["traps"].as_bool().unwrap_or(true),
-                timeout_secs: None,
-                http: args["http"].as_bool().unwrap_or(false),
-                port: args["port"].as_u64().and_then(|p| u16::try_from(p).ok()),
-                float_tolerance: args["float_tolerance"].as_f64(),
-            })?)?
+            let isolate = isolation::Isolation::from_args(
+                args["isolate"].as_bool().unwrap_or(false),
+                args["isolate_network"].as_bool().unwrap_or(false),
+                strings("isolate_ro").into_iter().map(PathBuf::from).collect(),
+                &strings("isolate_env"),
+            )?;
+            serde_json::to_value(app::record_with_isolation(
+                &app::RecordOptions {
+                    repo: &repo,
+                    run: &strings("run"),
+                    inputs: inputs.as_deref(),
+                    normalize: &strings("normalize"),
+                    name: args["name"].as_str(),
+                    traps: args["traps"].as_bool().unwrap_or(true),
+                    timeout_secs: None,
+                    http: args["http"].as_bool().unwrap_or(false),
+                    port: args["port"].as_u64().and_then(|p| u16::try_from(p).ok()),
+                    float_tolerance: args["float_tolerance"].as_f64(),
+                },
+                &isolate,
+            )?)?
         }
         "app_replay" => {
             let repo = path("repo")?;
-            serde_json::to_value(app::replay(&app::ReplayOptions {
-                repo: &repo,
-                build: args["build"].as_str(),
-                timeout_secs: None,
-                port: args["port"].as_u64().and_then(|p| u16::try_from(p).ok()),
-                case: args["case"].as_str(),
-            })?)?
+            let isolate = isolation::Isolation::from_args(
+                args["isolate"].as_bool().unwrap_or(false),
+                args["isolate_network"].as_bool().unwrap_or(false),
+                strings("isolate_ro").into_iter().map(PathBuf::from).collect(),
+                &strings("isolate_env"),
+            )?;
+            serde_json::to_value(app::replay_with_isolation(
+                &app::ReplayOptions {
+                    repo: &repo,
+                    build: args["build"].as_str(),
+                    timeout_secs: None,
+                    port: args["port"].as_u64().and_then(|p| u16::try_from(p).ok()),
+                    case: args["case"].as_str(),
+                },
+                &isolate,
+            )?)?
         }
         "app_front_door" => {
             let repo = path("repo")?;

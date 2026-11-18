@@ -28,6 +28,7 @@ pub mod harness_java;
 pub mod harness_py;
 pub mod harness_ruby;
 pub mod http;
+pub mod isolation;
 #[cfg(test)]
 mod js_number;
 pub mod lang;

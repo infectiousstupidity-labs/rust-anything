@@ -18,14 +18,14 @@ macro_rules! say_raw {
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use rust_anything::{analyze, app, bridge, front_door, gate, harness, lift, mcp, report, shadow};
+use rust_anything::{analyze, app, bridge, front_door, gate, harness, isolation, lift, mcp, report, shadow};
 
 #[derive(Parser)]
 #[command(
     name = "rust-anything",
     version,
     about = "Rewrite TypeScript/JavaScript, Python, C, Go, Ruby or Java apps in Rust, one verified piece at a time",
-    after_help = "Loop per unit: analyze -> bridge -> record -> port src/port.rs -> build -> diff -> shadow -> gate"
+    after_help = "Loop per unit: analyze -> bridge -> record -> port src/port.rs -> build -> diff -> shadow -> gate. Execution is trusted by default; opt into Linux Bubblewrap for app record/replay with --isolate."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -36,6 +36,40 @@ struct Cli {
 enum KindArg {
     Napi,
     Wasm,
+}
+
+
+#[derive(clap::Args)]
+struct IsolationArgs {
+    /// Run directly on the host with the invoking user's permissions (the default).
+    #[arg(long, conflicts_with = "isolate")]
+    trusted: bool,
+    /// Isolate the executed app with Linux Bubblewrap (fails closed if unavailable).
+    #[arg(long)]
+    isolate: bool,
+    /// Share host networking (needed for isolated HTTP servers; permits all outbound traffic).
+    #[arg(long, requires = "isolate")]
+    isolate_network: bool,
+    /// Extra host directory to mount read-only at /mnt/ro/0, /mnt/ro/1, ...
+    #[arg(long = "isolate-ro", requires = "isolate")]
+    isolate_ro: Vec<PathBuf>,
+    /// Explicit environment variable NAME=VALUE (repeatable; no host secrets inherited).
+    #[arg(long = "isolate-env", requires = "isolate")]
+    isolate_env: Vec<String>,
+}
+
+impl IsolationArgs {
+    fn validated(self) -> Result<isolation::Isolation> {
+        if self.trusted && self.isolate {
+            anyhow::bail!("--trusted and --isolate are mutually exclusive");
+        }
+        isolation::Isolation::from_args(
+            self.isolate,
+            self.isolate_network,
+            self.isolate_ro,
+            &self.isolate_env,
+        )
+    }
 }
 
 #[derive(Subcommand)]
@@ -246,6 +280,8 @@ enum AppCmd {
         /// Seconds before a run is killed (default 30).
         #[arg(long)]
         timeout: Option<u64>,
+        #[command(flatten)]
+        isolation: IsolationArgs,
         /// The app is a server: the command starts it, taking its port from PORT or `{port}`;
         /// cases are requests (curl lines in its docs, `--inputs`, traps), kept in `http/`.
         /// Curl @file bodies must be relative, regular files within the repository (docs included).
@@ -279,6 +315,8 @@ enum AppCmd {
         /// Seconds before a run is killed.
         #[arg(long)]
         timeout: Option<u64>,
+        #[command(flatten)]
+        isolation: IsolationArgs,
         /// Servers: the port the build always listens on; otherwise it gets a free one through
         /// PORT and `{port}`.
         #[arg(long)]
@@ -762,24 +800,29 @@ fn run_app(command: AppCmd) -> Result<ExitCode> {
             name,
             no_traps,
             timeout,
+            isolation,
             http,
             port,
             float_tolerance,
             json,
             run,
         } => {
-            let outcome = app::record(&app::RecordOptions {
-                repo: &repo,
-                run: &run,
-                inputs: inputs.as_deref(),
-                normalize: &normalize,
-                name: name.as_deref(),
-                traps: !no_traps,
-                timeout_secs: timeout,
-                http,
-                port,
-                float_tolerance,
-            })?;
+            let isolation = isolation.validated()?;
+            let outcome = app::record_with_isolation(
+                &app::RecordOptions {
+                    repo: &repo,
+                    run: &run,
+                    inputs: inputs.as_deref(),
+                    normalize: &normalize,
+                    name: name.as_deref(),
+                    traps: !no_traps,
+                    timeout_secs: timeout,
+                    http,
+                    port,
+                    float_tolerance,
+                },
+                &isolation,
+            )?;
             if json {
                 say!("{}", serde_json::to_string_pretty(&outcome)?);
                 return Ok(ExitCode::SUCCESS);
@@ -830,17 +873,22 @@ fn run_app(command: AppCmd) -> Result<ExitCode> {
             repo,
             build,
             timeout,
+            isolation,
             port,
             case,
             json,
         } => {
-            let outcome = app::replay(&app::ReplayOptions {
-                repo: &repo,
-                build: build.as_deref(),
-                timeout_secs: timeout,
-                port,
-                case: case.as_deref(),
-            })?;
+            let isolation = isolation.validated()?;
+            let outcome = app::replay_with_isolation(
+                &app::ReplayOptions {
+                    repo: &repo,
+                    build: build.as_deref(),
+                    timeout_secs: timeout,
+                    port,
+                    case: case.as_deref(),
+                },
+                &isolation,
+            )?;
             if json {
                 say!("{}", serde_json::to_string_pretty(&outcome)?);
             } else {

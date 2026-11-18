@@ -37,6 +37,39 @@ These are in scope:
   matching the tagged source.
 - The MCP server doing more than the tool call asked for.
 
+## Executing untrusted projects
+
+The default execution mode is **trusted host execution**. Commands that run original
+applications, test suites, builds or profilers (including unit `record`, `diff`,
+`profile`, `gate`, whole-app `app front-door`, `app wire` and `app lift`) have
+the invoking user's filesystem, network and environment permissions. MCP tools
+use those same permissions. A temporary working directory is not a sandbox.
+Do not use these commands on untrusted source without an external VM/container.
+
+`app record` and `app replay` alone offer opt-in `--isolate` on **Linux** using
+Bubblewrap. `--isolate` sets up separate namespaces, a private `/tmp` and
+`/session` writable working tree, a read-only `/project` mount, and only
+system runtime directories. The sandbox does not inherit the host environment.
+Explicit `--isolate-env NAME=VALUE` and values recorded in input fixtures are
+passed; reserved runtime variables cannot be overridden using `--isolate-env`.
+An operator may add a read-only directory with `--isolate-ro /host/path`,
+available at `/mnt/ro/N`; this deliberately grants access to its contents.
+There is no default mount of the host home directory, agent credentials, other
+repositories, or arbitrary writable host paths.
+
+Network namespaces are isolated by default. HTTP isolation requires
+`--isolate-network`, which shares the **full host network** (not a localhost-only
+allowlist); in that configuration the app can contact external endpoints.
+When Bubblewrap is absent or the kernel refuses namespace setup, isolation
+fails closed before launching app code. On macOS and Windows `--isolate`
+refuses to run. Isolated library replay is not supported.
+
+No OS container is an absolute security guarantee. A kernel sandbox escape,
+host-file changes racing input validation, overly broad operator-provided mounts,
+and compromised system runtime binaries remain risks. Build steps, unrelated
+tool commands and network-enabled servers are outside this mode's narrower
+guarantee. Use a dedicated VM for hostile workloads that need stronger isolation.
+
 ## Documented HTTP curl examples
 
 When recording HTTP examples with `app record --http`, curl `@file` request bodies

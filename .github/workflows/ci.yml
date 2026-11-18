@@ -32,6 +32,19 @@ jobs:
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
 
+  isolation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install Linux Bubblewrap
+        run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      - name: Check isolation options and actual boundary on supported hosts
+        run: |
+          cargo test --locked isolation::tests:: -- --nocapture
+          cargo test --locked isolated_app_record_and_replay -- --nocapture
+
   macos:
     runs-on: macos-latest
     steps:

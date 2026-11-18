@@ -5,6 +5,7 @@
 //! in `rust/app-cases/`. `replay` runs any build against those files and reports what differs.
 
 use crate::walk::Canonical;
+use crate::isolation::{Isolation, Workdir};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
@@ -370,9 +371,20 @@ fn is_python_program(program: &str) -> bool {
         })
 }
 
+#[cfg(test)]
 fn run_case(command: &[String], repo: &Path, case: &Case, timeout: Duration) -> Result<Run> {
+    run_case_isolated(command, repo, case, timeout, &Isolation::default())
+}
+
+fn run_case_isolated(
+    command: &[String],
+    repo: &Path,
+    case: &Case,
+    timeout: Duration,
+    isolation: &Isolation,
+) -> Result<Run> {
     let sandbox = temp_dir("run")?;
-    let result = run_in(command, repo, case, timeout, &sandbox);
+    let result = run_in(command, repo, case, timeout, &sandbox, isolation);
     let _ = std::fs::remove_dir_all(&sandbox);
     result
 }
@@ -383,6 +395,7 @@ fn run_in(
     case: &Case,
     timeout: Duration,
     sandbox: &Path,
+    isolation: &Isolation,
 ) -> Result<Run> {
     let work = sandbox.join("cwd");
     std::fs::create_dir_all(&work)?;
@@ -395,28 +408,42 @@ fn run_in(
     }
     let log = sandbox.join("fallback.log");
     let (program, rest) = command.split_first().context("empty command")?;
-    let mut cmd = Command::new(resolve_word(repo, program));
-    cmd.args(rest.iter().map(|w| resolve_word(repo, w)))
-        .args(&case.args)
-        .current_dir(&work)
+    let mut cmd = if isolation.enabled {
+        let words = std::iter::once(resolve_word(repo, program))
+            .chain(rest.iter().map(|w| resolve_word(repo, w)))
+            .collect::<Vec<_>>();
+        let mut env = case.env.clone();
+        for key in &case.env_remove {
+            env.remove(key);
+        }
+        let mut cmd = isolation.command(repo, sandbox, &words, Workdir::Work, &env)?;
+        cmd.args(&case.args);
+        cmd
+    } else {
+        let mut cmd = Command::new(resolve_word(repo, program));
+        cmd.args(rest.iter().map(|w| resolve_word(repo, w)))
+            .args(&case.args);
+        if !case.inherit_env {
+            cmd.env_clear();
+        }
+        #[cfg(windows)]
+        if is_python_program(program)
+            && (!case.inherit_env || std::env::var_os("PYTHONIOENCODING").is_none())
+        {
+            // Python otherwise inherits the legacy Windows console code page even though its
+            // stdio is piped. UTF-8 keeps generated Unicode traps recordable.
+            cmd.env("PYTHONIOENCODING", "utf-8");
+        }
+        for key in &case.env_remove {
+            cmd.env_remove(key);
+        }
+        cmd.envs(&case.env).env(FALLBACK_ENV, &log);
+        cmd
+    };
+    cmd.current_dir(&work)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    if !case.inherit_env {
-        cmd.env_clear();
-    }
-    #[cfg(windows)]
-    if is_python_program(program)
-        && (!case.inherit_env || std::env::var_os("PYTHONIOENCODING").is_none())
-    {
-        // Python otherwise inherits the legacy Windows console code page even though its stdio
-        // is piped. UTF-8 keeps generated Unicode traps recordable; a case can still override it.
-        cmd.env("PYTHONIOENCODING", "utf-8");
-    }
-    for key in &case.env_remove {
-        cmd.env_remove(key);
-    }
-    cmd.envs(&case.env).env(FALLBACK_ENV, &log);
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -1444,10 +1471,16 @@ pub(crate) fn reserve_case_name(
 }
 
 pub fn record(opts: &RecordOptions) -> Result<RecordOutcome> {
+    record_with_isolation(opts, &Isolation::default())
+}
+
+/// Opt-in isolated execution; the regular `record` API remains trusted.
+pub fn record_with_isolation(opts: &RecordOptions, isolation: &Isolation) -> Result<RecordOutcome> {
     let repo = opts
         .repo
         .canonical()
         .with_context(|| format!("no folder {}", opts.repo.display()))?;
+    isolation.validate(&repo)?;
     let existing = Config::load(&repo)?;
     let run = if !opts.run.is_empty() {
         opts.run.to_vec()
@@ -1503,7 +1536,11 @@ pub fn record(opts: &RecordOptions) -> Result<RecordOutcome> {
     };
     let norm = Normalizers::new(&config)?;
     if config.http.is_some() {
-        let outcome = crate::http::record(&repo, &config, &norm, opts)?;
+        ensure!(
+            !isolation.enabled || isolation.network,
+            "isolated HTTP recording requires --isolate-network to reach localhost"
+        );
+        let outcome = crate::http::record(&repo, &config, &norm, opts, isolation)?;
         config.unordered = unordered_of(&outcome.noise);
         std::fs::write(
             cases_dir(&repo).join(CONFIG_FILE),
@@ -1564,8 +1601,8 @@ pub fn record(opts: &RecordOptions) -> Result<RecordOutcome> {
 
     let timeout = Duration::from_secs(config.timeout_secs);
     let runs = par_map(&planned, |(_, case)| -> Result<(Run, Run)> {
-        let one = run_case(&config.run, &repo, case, timeout)?;
-        let two = run_case(&config.run, &repo, case, timeout)?;
+        let one = run_case_isolated(&config.run, &repo, case, timeout, isolation)?;
+        let two = run_case_isolated(&config.run, &repo, case, timeout, isolation)?;
         Ok((one, two))
     });
     let dir = cases_dir(&repo);
@@ -1942,8 +1979,9 @@ fn check(
     repo: &Path,
     spec: &Spec,
     timeout: Duration,
+    isolation: &Isolation,
 ) -> Result<(Vec<Problem>, Option<bool>)> {
-    let run = run_case(command, repo, &spec.case, timeout)?;
+    let run = run_case_isolated(command, repo, &spec.case, timeout, isolation)?;
     let mut problems = Vec::new();
     let status_ok = match (&spec.status, &run.status) {
         (Expect::Code(e), Status::Code(a)) => e == a,
@@ -2108,16 +2146,26 @@ pub(crate) fn recorded_args(repo: &Path) -> Result<Vec<(Vec<String>, bool)>> {
 }
 
 pub fn replay(opts: &ReplayOptions) -> Result<ReplayOutcome> {
+    replay_with_isolation(opts, &Isolation::default())
+}
+
+/// Opt-in isolated replay. An unsupported execution path fails closed.
+pub fn replay_with_isolation(opts: &ReplayOptions, isolation: &Isolation) -> Result<ReplayOutcome> {
     let repo = opts
         .repo
         .canonical()
         .with_context(|| format!("no folder {}", opts.repo.display()))?;
+    isolation.validate(&repo)?;
     let dir = checked_cases_dir(&repo)?;
     let config = Config::load(&repo)?;
     if config.is_none()
         && let Ok(state) = crate::front_door::State::load(&repo)
         && state.kind == crate::front_door::AppKind::Library
     {
+        ensure!(
+            !isolation.enabled,
+            "isolated library replay is not yet supported; refuse to execute on host"
+        );
         ensure!(
             opts.build.is_none(),
             "{} is a library: its cases replay through each unit's bindings, so --build does not apply",
@@ -2149,8 +2197,12 @@ pub fn replay(opts: &ReplayOptions) -> Result<ReplayOutcome> {
     let norm = Normalizers::new(&config)?;
     let timeout = Duration::from_secs(opts.timeout_secs.unwrap_or(config.timeout_secs));
     if config.http.is_some() {
+        ensure!(
+            !isolation.enabled || isolation.network,
+            "isolated HTTP replay requires --isolate-network to reach localhost"
+        );
         return crate::http::replay(
-            &repo, &config, &norm, &command, opts.port, opts.case, timeout,
+            &repo, &config, &norm, &command, opts.port, opts.case, timeout, isolation,
         );
     }
     let specs = only_case(load_specs(&dir)?, opts.case, |s| &s.name)?;
@@ -2158,7 +2210,7 @@ pub fn replay(opts: &ReplayOptions) -> Result<ReplayOutcome> {
         if matches!(spec.status, Expect::Skip) {
             return Ok((Vec::new(), None));
         }
-        check(&norm, &command, &repo, spec, timeout)
+        check(&norm, &command, &repo, spec, timeout, isolation)
     });
     let mut outcome = ReplayOutcome {
         build: command.clone(),
@@ -2325,6 +2377,61 @@ mod tests {
         }
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolated_app_record_and_replay_use_real_process_boundary() {
+        let repo = temp_dir("isolated-app-flow").unwrap();
+        let outside = repo.with_extension("unmounted-marker");
+        std::fs::write(&outside, "SECRET").unwrap();
+        std::fs::write(repo.join("visible.txt"), "VISIBLE").unwrap();
+        let isolation = Isolation::from_args(true, false, Vec::new(), &[]).unwrap();
+        if let Err(error) = isolation.validate(&repo) {
+            eprintln!("Bubblewrap unavailable; request failed closed: {error:#}");
+            std::fs::remove_dir_all(repo).unwrap();
+            std::fs::remove_file(outside).unwrap();
+            return;
+        }
+        let script = format!(
+            "cat /project/visible.txt; test ! -e '{}'; \
+             test -z \"$CARGO_HOME\" && test -z \"$SSH_AUTH_SOCK\"",
+            outside.display()
+        );
+        let command = ["/bin/sh".into(), "-c".into(), script];
+        let recorded = record_with_isolation(
+            &RecordOptions {
+                repo: &repo,
+                run: &command,
+                inputs: None,
+                normalize: &[],
+                name: None,
+                traps: false,
+                timeout_secs: None,
+                http: false,
+                port: None,
+                float_tolerance: None,
+            },
+            &isolation,
+        )
+        .unwrap();
+        assert_eq!(recorded.cases, 1);
+        let replayed = replay_with_isolation(
+            &ReplayOptions {
+                repo: &repo,
+                build: None,
+                timeout_secs: None,
+                port: None,
+                case: None,
+            },
+            &isolation,
+        )
+        .unwrap();
+        assert_eq!((replayed.passed, replayed.total), (1, 1));
+        assert!(std::fs::read_to_string(recorded.dir.join("no-args.stdout"))
+            .is_ok_and(|s| s.contains("VISIBLE")));
+        std::fs::remove_dir_all(repo).unwrap();
+        std::fs::remove_file(outside).unwrap();
     }
 
     #[test]

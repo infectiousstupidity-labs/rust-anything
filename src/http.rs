@@ -17,6 +17,7 @@ use crate::app::{
     self, Config, Failure, Fallback, Normalizers, Problem, RecordOptions, RecordOutcome,
     ReplayOutcome,
 };
+use crate::isolation::{Isolation, Workdir};
 
 pub const HTTP_DIR: &str = "http";
 const READY: Duration = Duration::from_secs(60);
@@ -245,7 +246,7 @@ struct Server {
 }
 
 impl Server {
-    fn start(command: &[String], repo: &Path, port: u16) -> Result<Server> {
+    fn start(command: &[String], repo: &Path, port: u16, isolation: &Isolation) -> Result<Server> {
         let dir = app::temp_dir("server")?;
         let words: Vec<String> = command
             .iter()
@@ -253,11 +254,19 @@ impl Server {
             .collect();
         let (program, rest) = words.split_first().context("empty command")?;
         let log = dir.join("fallback.log");
-        let mut child = Command::new(program)
-            .args(rest)
-            .current_dir(repo)
-            .env("PORT", port.to_string())
-            .env(app::FALLBACK_ENV, &log)
+        let mut cmd = if isolation.enabled {
+            std::fs::create_dir_all(dir.join("cwd"))?;
+            let env = BTreeMap::from([("PORT".to_string(), port.to_string())]);
+            isolation.command(repo, &dir, &words, Workdir::Project, &env)?
+        } else {
+            let mut cmd = Command::new(program);
+            cmd.args(rest)
+                .current_dir(repo)
+                .env("PORT", port.to_string())
+                .env(app::FALLBACK_ENV, &log);
+            cmd
+        };
+        let mut child = cmd
             .stdin(Stdio::null())
             .stdout(std::fs::File::create(dir.join("stdout"))?)
             .stderr(std::fs::File::create(dir.join("stderr"))?)
@@ -349,8 +358,9 @@ fn run_all(
     port: u16,
     reqs: &[&Req],
     timeout: Duration,
+    isolation: &Isolation,
 ) -> Result<Vec<Answer>> {
-    let mut server = Server::start(command, repo, port)?;
+    let mut server = Server::start(command, repo, port, isolation)?;
     let mut out = Vec::new();
     for req in reqs {
         let before = server.fallbacks().unwrap_or(0);
@@ -761,6 +771,7 @@ pub(crate) fn record(
     config: &Config,
     norm: &Normalizers,
     opts: &RecordOptions,
+    isolation: &Isolation,
 ) -> Result<RecordOutcome> {
     let examples = app::scan_examples(repo, |line, doc_dir| parse_curl(line, repo, doc_dir));
     let inputs = match opts.inputs {
@@ -823,6 +834,7 @@ pub(crate) fn record(
         fixed.map_or_else(free_port, Ok)?,
         &reqs,
         timeout,
+        isolation,
     )?;
     let two = run_all(
         &config.run,
@@ -830,6 +842,7 @@ pub(crate) fn record(
         fixed.map_or_else(free_port, Ok)?,
         &reqs,
         timeout,
+        isolation,
     )?;
 
     let dir = app::cases_dir(repo).join(HTTP_DIR);
@@ -988,6 +1001,7 @@ pub(crate) fn replay(
     port: Option<u16>,
     case: Option<&str>,
     timeout: Duration,
+    isolation: &Isolation,
 ) -> Result<ReplayOutcome> {
     let dir = app::cases_dir(repo);
     let specs = app::only_case(load_specs(&dir.join(HTTP_DIR))?, case, |s| &s.name)?;
@@ -996,7 +1010,7 @@ pub(crate) fn replay(
         None => free_port()?,
     };
     let reqs: Vec<&Req> = specs.iter().map(|s| &s.req).collect();
-    let answers = run_all(command, repo, port, &reqs, timeout)?;
+    let answers = run_all(command, repo, port, &reqs, timeout, isolation)?;
     let mut outcome = ReplayOutcome {
         build: command.to_vec(),
         passed: 0,
