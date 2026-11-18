@@ -108,11 +108,12 @@ pub(crate) fn default_timeout() -> u64 {
 
 impl Config {
     pub fn load(repo: &Path) -> Result<Option<Config>> {
-        let path = cases_dir(repo).join(CONFIG_FILE);
-        if !path.exists() {
+        let root = checked_cases_dir(repo)?;
+        let path = root.join(CONFIG_FILE);
+        let Some(validated) = fixture_entry(&root, &path, false)? else {
             return Ok(None);
-        }
-        let text = std::fs::read_to_string(&path)
+        };
+        let text = std::fs::read_to_string(&validated)
             .with_context(|| format!("reading {}", path.display()))?;
         Ok(Some(
             serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?,
@@ -1703,9 +1704,9 @@ fn read_fixture_files(root: &Path, base: &Path) -> Result<BTreeMap<PathBuf, Vec<
             } else if kind.is_file() {
                 let resolved = fixture_entry(root, &path, false)?
                     .with_context(|| format!("fixture file disappeared: {}", path.display()))?;
-                let relative = resolved
-                    .strip_prefix(base)
-                    .with_context(|| format!("{} is outside {}", resolved.display(), base.display()))?;
+                let relative = resolved.strip_prefix(base).with_context(|| {
+                    format!("{} is outside {}", resolved.display(), base.display())
+                })?;
                 ensure!(
                     relative.components().all(|c| matches!(c, Component::Normal(_))),
                     "{}: invalid fixture file path",
@@ -1781,10 +1782,13 @@ fn load_spec(dir: &Path, path: &Path) -> Result<Spec> {
                 .collect();
         }
     }
-    let custom_base = doc
-        .get("fs")
-        .and_then(|f| f.get("base"))
-        .and_then(Item::as_str);
+    let custom_base = match doc.get("fs").and_then(|f| f.get("base")) {
+        Some(item) => Some(
+            item.as_str()
+                .with_context(|| format!("{}: fs.base must be a string", path.display()))?,
+        ),
+        None => None,
+    };
     if let Some(base) = custom_base {
         ensure!(
             fixture_relative(base),
@@ -2300,6 +2304,25 @@ mod tests {
         symlink(&external_toml, &linked_case).unwrap();
         assert!(load_spec(&root, &linked_case).is_err());
 
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn fixture_loader_rejects_windows_directory_symlink_escape() {
+        use std::os::windows::fs::symlink_dir;
+
+        let root = temp_dir("fixture-windows-link").unwrap();
+        let outside = root.with_extension("private");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("private.txt"), "DO-NOT-READ").unwrap();
+        let path = root.join("sample.toml");
+        std::fs::write(&path, "[fs]\nbase = 'sample.in'\n").unwrap();
+        if symlink_dir(&outside, root.join("sample.in")).is_ok() {
+            let err = load_spec(&root, &path).err().unwrap().to_string();
+            assert!(err.contains("escapes"), "{err}");
+        }
         std::fs::remove_dir_all(root).unwrap();
         std::fs::remove_dir_all(outside).unwrap();
     }
