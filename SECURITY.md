@@ -37,6 +37,22 @@ These are in scope:
   matching the tagged source.
 - The MCP server doing more than the tool call asked for.
 
+## Documented HTTP curl examples
+
+When recording HTTP examples with `app record --http`, curl `@file` request bodies
+are accepted only from regular files within the repository root. Relative paths are
+resolved first from the repository root and then from the documentation file's folder.
+Absolute paths, parent-directory traversal and symlinks resolving outside the
+repository are rejected with a warning; the example is skipped. The `--data-raw`
+option treats `@` literally.
+
+This restriction applies to importing curl request bodies, **not** to the code
+being executed: `app record` still starts the original application with the
+invoking user's filesystem permissions. Do not run untrusted projects without OS
+isolation. As with other path checks, concurrently modified filesystem trees are
+outside the protection guarantee; use immutable or isolated input checkouts for
+adversarial local writers.
+
 ## Disclosure
 
 Once a fix is released, the advisory is published with credit to the reporter, unless they prefer

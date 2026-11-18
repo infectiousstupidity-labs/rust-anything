@@ -4,7 +4,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -393,6 +393,62 @@ fn percent_encode(text: &str) -> String {
     out
 }
 
+/// Read documented curl @file bodies only from regular files inside the project tree.
+/// Relative names are tried at the repo root, then beside the documentation file.
+fn read_curl_body_file(value: &str, repo: &Path, doc_dir: &Path) -> Option<String> {
+    let name = value.strip_prefix('@')?;
+    let relative = Path::new(name);
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_) | Component::CurDir))
+    {
+        eprintln!(
+            "warning: ignoring curl example: @file {value:?} must be project-relative without .."
+        );
+        return None;
+    }
+
+    let root = match repo.canonicalize() {
+        Ok(root) => root,
+        Err(err) => {
+            eprintln!("warning: ignoring curl example: cannot resolve repository root: {err}");
+            return None;
+        }
+    };
+    for base in [repo, doc_dir] {
+        let candidate = base.join(relative);
+        let resolved = match candidate.canonicalize() {
+            Ok(resolved) => resolved,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => {
+                eprintln!("warning: ignoring curl example: cannot resolve @file {value:?}: {err}");
+                return None;
+            }
+        };
+        if !resolved.starts_with(&root) {
+            eprintln!(
+                "warning: ignoring curl example: @file {value:?} resolves outside repository {}",
+                root.display()
+            );
+            return None;
+        }
+        if !resolved.is_file() {
+            eprintln!("warning: ignoring curl example: @file {value:?} is not a regular file");
+            return None;
+        }
+        return match std::fs::read_to_string(&resolved) {
+            Ok(contents) => Some(contents),
+            Err(err) => {
+                eprintln!("warning: ignoring curl example: cannot read @file {value:?}: {err}");
+                None
+            }
+        };
+    }
+    eprintln!("warning: ignoring curl example: @file {value:?} not found in project or docs");
+    None
+}
+
 fn parse_curl(line: &str, repo: &Path, doc_dir: &Path) -> Option<Req> {
     let toks = app::shell_tokens(line)?;
     if toks.iter().any(|t| t.op) {
@@ -408,13 +464,6 @@ fn parse_curl(line: &str, repo: &Path, doc_dir: &Path) -> Option<Req> {
     let mut data: Vec<String> = Vec::new();
     let mut url: Option<String> = None;
     let mut i = 0;
-    let read_file = |name: &str| -> Option<String> {
-        let name = name.strip_prefix('@')?;
-        [repo.join(name), doc_dir.join(name)]
-            .iter()
-            .find(|p| p.is_file())
-            .and_then(|p| std::fs::read_to_string(p).ok())
-    };
     while i < args.len() {
         let arg = &args[i];
         let mut next = || -> Option<String> {
@@ -431,7 +480,7 @@ fn parse_curl(line: &str, repo: &Path, doc_dir: &Path) -> Option<Req> {
             "-d" | "--data" | "--data-raw" | "--data-binary" | "--data-ascii" => {
                 let d = next()?;
                 data.push(if d.starts_with('@') && arg != "--data-raw" {
-                    let mut contents = read_file(&d)?;
+                    let mut contents = read_curl_body_file(&d, repo, doc_dir)?;
                     if arg != "--data-binary" {
                         contents.retain(|c| !matches!(c, '\r' | '\n' | '\0'));
                     }
@@ -443,7 +492,7 @@ fn parse_curl(line: &str, repo: &Path, doc_dir: &Path) -> Option<Req> {
             "--json" => {
                 let d = next()?;
                 data.push(if d.starts_with('@') {
-                    read_file(&d)?
+                    read_curl_body_file(&d, repo, doc_dir)?
                 } else {
                     d
                 });
@@ -1089,6 +1138,66 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
         assert_eq!(data, "onetwothree");
         assert_eq!(binary, "one\r\ntwo\0\nthree");
+    }
+
+    #[test]
+    fn curl_file_bodies_stay_inside_repository() {
+        let root = app::temp_dir("curl-file-boundary").unwrap();
+        let docs = root.join("docs");
+        std::fs::create_dir_all(&docs).unwrap();
+        std::fs::write(root.join("body.txt"), "root content").unwrap();
+        std::fs::write(docs.join("body.json"), "{\"ok\":true}").unwrap();
+        let outside = root.with_extension("external");
+        std::fs::write(&outside, "PRIVATE-MARKER").unwrap();
+
+        let parse = |flag: &str, value: &str| {
+            parse_curl(
+                &format!("curl {flag} '{value}' http://localhost/upper"),
+                &root,
+                &docs,
+            )
+        };
+        assert_eq!(
+            parse("--data-binary", "@body.txt").unwrap().body.as_deref(),
+            Some("root content")
+        );
+        assert_eq!(
+            parse("--json", "@body.json").unwrap().body.as_deref(),
+            Some("{\"ok\":true}")
+        );
+        assert_eq!(
+            parse("--data-raw", &format!("@{}", outside.display()))
+                .unwrap()
+                .body
+                .as_deref(),
+            Some(format!("@{}", outside.display()).as_str())
+        );
+
+        let absolute = format!("@{}", outside.display());
+        let traversal = format!("@../{}", outside.file_name().unwrap().to_string_lossy());
+        let nested = format!("@docs/../../{}", outside.file_name().unwrap().to_string_lossy());
+        for input in [&absolute, &traversal, &nested] {
+            for flag in ["--data", "--data-binary", "--json"] {
+                assert!(
+                    parse(flag, input).is_none(),
+                    "accepted escaped input {flag} {input}"
+                );
+            }
+        }
+        assert!(parse("--data-binary", "@docs").is_none());
+
+        let link = root.join("external-link");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&outside, &link).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&outside, &link).is_ok();
+        if linked {
+            assert!(parse("--data-binary", "@external-link").is_none());
+            assert!(parse("--json", "@external-link").is_none());
+        }
+
+        std::fs::remove_dir_all(&root).unwrap();
+        std::fs::remove_file(outside).unwrap();
     }
 
     #[test]

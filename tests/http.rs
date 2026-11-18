@@ -135,6 +135,52 @@ fn http_record_keeps_distinct_requests_with_the_same_name() {
     );
 }
 
+#[test]
+fn http_record_does_not_persist_curl_files_outside_repository() {
+    if !available("node", "--version") {
+        return;
+    }
+    let repo = fixture("ts", "file-boundary");
+    let outside = repo.with_extension("external-marker");
+    std::fs::write(&outside, "PRIVATE-OUTSIDE-PAYLOAD").unwrap();
+    std::fs::write(repo.join("payload.txt"), "allowed root body").unwrap();
+    std::fs::create_dir_all(repo.join("docs")).unwrap();
+    std::fs::write(repo.join("docs/payload.txt"), "allowed docs body").unwrap();
+
+    let link = repo.join("escaped-link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&outside, &link).unwrap();
+    #[cfg(windows)]
+    let _ = std::os::windows::fs::symlink_file(&outside, &link);
+
+    let readme = format!(
+        "~~~sh\ncurl --data-binary @payload.txt http://localhost/upper\n\
+         curl --data-binary @docs/payload.txt http://localhost/upper\n\
+         curl --data-binary '@{}' http://localhost/upper\n\
+         curl --data-binary '@../{}' http://localhost/upper\n\
+         curl --data-binary @escaped-link http://localhost/upper\n~~~\n",
+        outside.display(),
+        outside.file_name().unwrap().to_string_lossy()
+    );
+    std::fs::write(repo.join("README.md"), readme).unwrap();
+    let out = record(&repo, "node server.js", false);
+    assert_eq!(out.examples, 2, "{out:?}");
+    assert_eq!(out.cases, 2, "{out:?}");
+    let cases = std::fs::read_dir(&out.dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "toml"))
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(cases.len(), 2);
+    assert!(cases.iter().any(|case| case.contains("allowed root body")));
+    assert!(cases.iter().any(|case| case.contains("allowed docs body")));
+    assert!(cases.iter().all(|case| !case.contains("PRIVATE-OUTSIDE-PAYLOAD")));
+
+    std::fs::remove_dir_all(repo).unwrap();
+    std::fs::remove_file(outside).unwrap();
+}
+
 /// How to build and run one language's server, and a copy with a changed error message.
 struct Lang {
     name: &'static str,

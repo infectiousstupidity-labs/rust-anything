@@ -248,6 +248,7 @@ enum AppCmd {
         timeout: Option<u64>,
         /// The app is a server: the command starts it, taking its port from PORT or `{port}`;
         /// cases are requests (curl lines in its docs, `--inputs`, traps), kept in `http/`.
+        /// Curl @file bodies must be relative, regular files within the repository (docs included).
         #[arg(long)]
         http: bool,
         /// A port the server always listens on (implies --http).
