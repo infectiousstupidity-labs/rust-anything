@@ -73,6 +73,13 @@ No Rust toolchain yet? Prebuilt binaries for macOS, Linux and Windows are attach
 [GitHub release](https://github.com/erkamyaman/rust-anything/releases), and for JavaScript
 projects `npm install -g rust-anything` installs the same binary.
 
+To verify that a particular npm-installed executable matches the native binary
+built for a release tag, follow the [release provenance and independent
+verification guide](./docs/release-verification.md). It checks signed GitHub
+attestations, all five platform SHA-256 digests, the exact npm tarball, and
+release archive identity. Availability of attestations depends on the tagged
+release using the new release workflow.
+
 In Claude Code you can also install it as a plugin (the MCP server and the skill; the CLI above
 must be on your `PATH`):
 

@@ -19,6 +19,10 @@ jobs:
           - { os: macos-latest, target: x86_64-apple-darwin, npm: darwin-x64 }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, npm: win32-x64 }
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -42,6 +46,13 @@ jobs:
           cd dist
           if [ "$RUNNER_OS" = Windows ]; then 7z a "$name.zip" "$name" > /dev/null; else tar czf "$name.tar.gz" "$name"; fi
           rm -rf "$name"
+      # These signed subjects carry this job's exact source commit/ref/workflow,
+      # with the target visible in the matrix/job and archive filename.
+      - uses: actions/attest@v4
+        with:
+          subject-path: |
+            npm-bin/*
+            dist/*
       - uses: actions/upload-artifact@v4
         with:
           name: dist-${{ matrix.target }}
@@ -53,29 +64,115 @@ jobs:
           path: npm-bin/*
           if-no-files-found: error
 
-  github:
+  assemble:
     needs: build
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: npm install -g npm@latest
+      - name: Reject mismatched and tampered synthetic release artifacts
+        run: node --test scripts/test-release-provenance.mjs
       - uses: actions/download-artifact@v4
         with:
           pattern: dist-*
           path: dist
           merge-multiple: true
-      - name: Create the GitHub release
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: npm-*
+          path: npm-bin
+      - name: Assemble the one immutable npm tarball and release archive set
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          package_dir=$(node scripts/npm-packages.mjs "$version" npm-bin npm-out)
+          mkdir -p release-bundle
+          cp dist/* release-bundle/
+          cp "$package_dir/binaries/SHA256SUMS" release-bundle/NATIVE-SHA256SUMS
+          npm pack "$package_dir" --pack-destination release-bundle --silent
+          node scripts/release-provenance.mjs create \
+            --dir release-bundle --npm-bin npm-bin --tag "$GITHUB_REF_NAME" \
+            --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
+          node scripts/release-provenance.mjs verify \
+            --dir release-bundle --tag "$GITHUB_REF_NAME" \
+            --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
+          # Fail before creating a GitHub release if npm already hosts a
+          # different immutable package under this exact version.
+          if npm view "rust-anything@$version" version > /dev/null 2>&1; then
+            mkdir -p existing-npm
+            npm pack "rust-anything@$version" --pack-destination existing-npm --silent
+            node scripts/release-provenance.mjs verify-published \
+              --dir release-bundle --tarball "existing-npm/rust-anything-$version.tgz"
+          fi
+      - name: Attest all release files including the exact npm tarball
+        uses: actions/attest@v4
+        with:
+          subject-path: 'release-bundle/*'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-release-files
+          path: release-bundle/*
+          if-no-files-found: error
+          retention-days: 90
+
+  github:
+    needs: assemble
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      attestations: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-release-files
+          path: release-bundle
+      - name: Independently verify release assets and their GitHub signatures
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          (cd dist && sha256sum * > SHA256SUMS)
+          set -euo pipefail
+          gh_version=$(gh --version | awk 'NR==1 {print $3}')
+          if [ "$(printf '%s\n' '2.102.0' "$gh_version" | sort -V | head -1)" != '2.102.0' ]; then
+            echo "gh CLI >= 2.102.0 required for strict signer/ref verification; found $gh_version" >&2
+            exit 1
+          fi
+          node scripts/release-provenance.mjs verify \
+            --dir release-bundle --tag "$GITHUB_REF_NAME" \
+            --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
+          for file in release-bundle/*; do
+            gh attestation verify "$file" \
+              --repo "$GITHUB_REPOSITORY" \
+              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml" \
+              --source-ref "refs/tags/$GITHUB_REF_NAME" \
+              --source-digest "$GITHUB_SHA" \
+              --deny-self-hosted-runners
+          done
+      - name: Create GitHub release only after provenance verification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
           awk -v v="$version" '/^## /{ if (on) exit; if (index($0, "## " v " ") == 1) { on = 1; next } } on' CHANGELOG.md > notes.md
-          gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+          gh release create "$GITHUB_REF_NAME" release-bundle/* \
+            --title "$GITHUB_REF_NAME" --notes-file notes.md --verify-tag
 
   npm:
-    needs: build
+    needs: github
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -89,20 +186,37 @@ jobs:
       - run: npm install -g npm@latest
       - uses: actions/download-artifact@v4
         with:
-          pattern: npm-*
-          path: npm-bin
-      - name: Publish to npm (trusted publishing)
+          name: verified-release-files
+          path: release-bundle
+      - name: Check exact tarball bytes before publishing
+        shell: bash
         run: |
+          node scripts/release-provenance.mjs verify \
+            --dir release-bundle --tag "$GITHUB_REF_NAME" \
+            --commit "$GITHUB_SHA" --repo "$GITHUB_REPOSITORY"
+      - name: Publish the preverified tarball via npm trusted publishing
+        shell: bash
+        run: |
+          set -euo pipefail
           version="${GITHUB_REF_NAME#v}"
-          dir=$(node scripts/npm-packages.mjs "$version" npm-bin npm-out)
+          package="release-bundle/rust-anything-$version.tgz"
           if npm view "rust-anything@$version" version > /dev/null 2>&1; then
-            echo "rust-anything@$version is already on npm"
+            echo "rust-anything@$version already published; verifying immutable registry bytes"
           else
-            npm publish "$dir" --access public
+            npm publish "$package" --access public
           fi
+          mkdir -p published
+          for attempt in 1 2 3 4 5 6; do
+            if npm pack "rust-anything@$version" --pack-destination published --silent; then
+              break
+            fi
+            sleep 10
+          done
+          node scripts/release-provenance.mjs verify-published \
+            --dir release-bundle --tarball "published/rust-anything-$version.tgz"
 
   crates:
-    needs: build
+    needs: github
     runs-on: ubuntu-latest
     permissions:
       contents: read

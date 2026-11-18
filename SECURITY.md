@@ -37,6 +37,24 @@ These are in scope:
   matching the tagged source.
 - The MCP server doing more than the tool call asked for.
 
+## Native release and npm provenance
+
+New release workflows attest all five platform-native executables, their
+GitHub archive assets, the release inventory, and the exact prebuilt npm
+tarball. The build outputs and npm contents are compared byte-for-byte before
+the GitHub release or npm publisher can proceed. The npm publisher reuses
+the same signed tarball, and must verify the immutable npm registry copy
+matches it, including for already-published versions.
+
+See [Release verification](./docs/release-verification.md) for concrete
+`gh attestation verify`, source-commit/ref, SHA-256, archive and npm
+verification commands and expected outputs. The `release-manifest.json`
+and SHA256SUMS files are **not independent signatures**. Attestations prove
+a file was attested in a particular GitHub workflow but do not prove
+reproducible builds or immunity to compromised build tools. Maintainers must
+verify that the npm publisher has rights to the package and is configured for
+the correct GitHub repository and workflow.
+
 ## MCP tool authorization
 
 The stdio MCP server is **restricted by default**. Its working directory is

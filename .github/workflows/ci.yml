@@ -31,6 +31,8 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - name: Release provenance and tampered artifact regression suite
+        run: node --test scripts/test-release-provenance.mjs
       - name: MCP workspace and execution-policy regressions
         run: |
           cargo test --locked --lib mcp_policy::tests:: -- --nocapture
