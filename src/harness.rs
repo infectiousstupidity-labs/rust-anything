@@ -295,7 +295,10 @@ pub fn record(opts: &RecordOptions) -> Result<RecordOutcome> {
             .iter()
             .map(|c| serde_json::json!({
                 "fn": c["fn"].clone(),
+                "class": c["class"].clone(),
                 "args": c["args"].clone(),
+                "ctor": c["ctor"].clone(),
+                "calls": c["calls"].clone(),
                 "reason": c["reason"].clone(),
                 "case_index": c["case_index"].clone(),
             }))
