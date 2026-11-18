@@ -291,6 +291,61 @@ rust-anything app lift .
   files read at run time and asset folders not embedded, and replay on the pure binary. Only when
   all of it passes are the changes written back. The original is never touched.
 
+### MCP workspace and execution permissions
+
+The stdio MCP server enforces an independent, **restricted-by-default** policy.
+The allowed filesystem root is the MCP process's working directory unless
+`--root` explicitly grants one or more other directories. An implicit root
+of the home directory or filesystem root is refused as too broad. It resolves symlinks,
+checks output destinations and manifest-derived paths, and rejects traversal.
+A tool request cannot change these server-side grants.
+
+~~~sh
+# Read-only analysis in the MCP process's working directory:
+rust-anything mcp
+
+# Full non-destructive coding loop for a trusted repository:
+rust-anything mcp --root /absolute/path/to/repo --allow-exec
+
+# Explicit second workspace for source data or output:
+rust-anything mcp --root /path/to/repo --root /path/to/fixtures --allow-exec
+
+# Allow the destructive app_lift action:
+rust-anything mcp --root /path/to/repo --allow-exec --allow-destructive
+
+# Unsafe legacy behavior: no MCP path/permission checks:
+rust-anything mcp --unrestricted
+~~~
+
+`analyze` is read-only. All other MCP tools can invoke host processes,
+including formatters used by `bridge`, `refresh` and `shadow`; they
+therefore require `--allow-exec`. `app_lift` requires a separate
+`--allow-destructive` grant. Descriptions, MCP annotations, and result
+metadata state each tool's read/write/execution/destructive effects.
+
+An explicit execution grant means **host execution with the agent's user
+permissions**. It does *not* prevent spawned commands, build scripts or tests
+from writing outside allowed roots or contacting the network. An untrusted
+repository needs a VM/container or an independently configured OS sandbox.
+MCP root checks can also race concurrent malicious filesystem changes. Host
+approval prompts are additional safeguards, not server-side enforcement.
+
+`rust-anything setup` deliberately registers the conservative `["mcp"]`
+invocation. For in-repository agent work, update the agent's MCP configuration
+to use `["mcp", "--root", "/absolute/path/to/repo", "--allow-exec"]`.
+A project-local configuration, for example:
+
+~~~json
+{
+  "mcpServers": {
+    "rust-anything": {
+      "command": "rust-anything",
+      "args": ["mcp", "--root", "/absolute/path/to/repo", "--allow-exec"]
+    }
+  }
+}
+~~~
+
 ### Execution security: trusted vs isolated
 
 By default (or with `app record --trusted` / `app replay --trusted`),

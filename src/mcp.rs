@@ -11,10 +11,16 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::{analyze, app, bridge, front_door, gate, harness, isolation, lift, shadow};
+use crate::mcp_policy::{McpPolicy, effects};
 
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
 pub fn serve() -> Result<()> {
+    serve_with_policy(McpPolicy::new(&[], false, false, false)?)
+}
+
+/// Serve with a fixed policy chosen by the operator, never by an MCP tool call.
+pub fn serve_with_policy(policy: McpPolicy) -> Result<()> {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout().lock();
     for line in stdin.lock().lines() {
@@ -23,7 +29,7 @@ pub fn serve() -> Result<()> {
             continue;
         }
         let response = match serde_json::from_str::<Value>(&line) {
-            Ok(request) => handle(&request),
+            Ok(request) => handle_with_policy(&request, &policy),
             Err(e) => Some(error(Value::Null, -32700, &format!("parse error: {e}"))),
         };
         if let Some(response) = response {
@@ -36,32 +42,57 @@ pub fn serve() -> Result<()> {
 
 /// The response to one JSON-RPC message; `None` for notifications.
 pub fn handle(request: &Value) -> Option<Value> {
-    let id = request.get("id").cloned();
+    let id = request.get("id").cloned()?;
+    let policy = match McpPolicy::new(&[], false, false, false) {
+        Ok(policy) => policy,
+        Err(error) => return Some(error_response(id, &format!("{error:#}"))),
+    };
+    handle_with_policy(request, &policy)
+}
+
+fn error_response(id: Value, message: &str) -> Value {
+    error(id, -32603, message)
+}
+
+fn handle_with_policy(request: &Value, policy: &McpPolicy) -> Option<Value> {
+    let id = request.get("id").cloned()?;
     let method = request["method"].as_str().unwrap_or_default();
-    let id = id?;
     let result = match method {
         "initialize" => json!({
             "protocolVersion": request["params"]["protocolVersion"].as_str().unwrap_or(PROTOCOL_VERSION),
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "rust-anything", "version": env!("CARGO_PKG_VERSION") },
-            "instructions": "Incremental TS/JS to Rust migration. Loop per unit: analyze -> bridge -> \
-                record -> (port src/port.rs) -> build -> diff -> shadow -> gate. Never mark a port done \
-                before gate passes. Execution uses host permissions unless explicitly                 isolated via app_record/app_replay on Linux.",
+            "instructions": format!(
+                concat!(
+                    "Incremental migration: analyze -> bridge -> record -> build -> diff -> gate. ",
+                    "Never mark a port done before gate passes. {} ",
+                    "MCP execution grants host permissions, not OS isolation. ",
+                    "Whole-app record/replay can separately use Linux Bubblewrap isolation."
+                ),
+                policy.summary()
+            ),
         }),
         "ping" => json!({}),
         "tools/list" => json!({ "tools": tools() }),
         "tools/call" => {
             let name = request["params"]["name"].as_str().unwrap_or_default();
             let args = &request["params"]["arguments"];
-            match call(name, args) {
+            let effect = effects(name).map(|e| json!({
+                "filesystem_write": e.write,
+                "process_execution": e.execute,
+                "destructive": e.destructive,
+            }));
+            match policy.authorize(name, args).and_then(|_| call(name, args)) {
                 Ok(value) => json!({
                     "content": [{ "type": "text", "text": serde_json::to_string_pretty(&value).unwrap_or_default() }],
                     "structuredContent": value,
                     "isError": false,
+                    "_meta": { "rust-anything/tool-effects": effect },
                 }),
                 Err(e) => json!({
                     "content": [{ "type": "text", "text": format!("{e:#}") }],
                     "isError": true,
+                    "_meta": { "rust-anything/tool-effects": effect },
                 }),
             }
         }
@@ -76,7 +107,7 @@ fn error(id: Value, code: i64, message: &str) -> Value {
 
 fn tools() -> Value {
     let crate_dir = json!({ "type": "string", "description": "Folder of the generated crate (holds rust-anything.json)." });
-    json!([
+    let mut definitions = json!([
         {
             "name": "analyze",
             "description": "Map a repository (TypeScript/JavaScript, Python, C, Go, Ruby or Java): units, port order (waves), risks with file:line, bridge per unit, dependency-to-crate fit, and `start_here`: the best first ports.",
@@ -221,7 +252,26 @@ fn tools() -> Value {
                 "repo": { "type": "string", "description": "Repository root." },
             }, "required": ["repo"] },
         },
-    ])
+    ]);
+    if let Some(entries) = definitions.as_array_mut() {
+        for entry in entries {
+            let name = entry["name"].as_str().unwrap_or_default().to_owned();
+            let kind = effects(&name).expect("all exposed MCP tools must be classified");
+            let description = entry["description"].as_str().unwrap_or_default();
+            entry["description"] = json!(format!(
+                "[{}] {} Restricted MCP requires --allow-exec for process-executing tools;                  --allow-destructive additionally permits app_lift.",
+                kind.label(),
+                description
+            ));
+            entry["annotations"] = json!({
+                "readOnlyHint": !kind.write && !kind.execute,
+                "destructiveHint": kind.destructive,
+                "idempotentHint": !kind.write && !kind.execute,
+                "openWorldHint": kind.execute,
+            });
+        }
+    }
+    definitions
 }
 
 fn call(name: &str, args: &Value) -> Result<Value> {
@@ -476,4 +526,37 @@ mod tests {
         let unknown = handle(&json!({ "jsonrpc": "2.0", "id": 4, "method": "nope" })).unwrap();
         assert_eq!(unknown["error"]["code"], -32601);
     }
+    #[test]
+    fn restricted_mcp_refuses_execution_before_calling_the_tool() {
+        let root = std::env::current_dir().unwrap();
+        let policy = McpPolicy::new(&[root.clone()], false, false, false).unwrap();
+        let req = json!({
+            "jsonrpc":"2.0", "id":99, "method":"tools/call",
+            "params":{"name":"profile", "arguments":{
+                "root":root, "command":["sh","-c","echo should-not-run"]
+            }}
+        });
+        let response = handle_with_policy(&req, &policy).unwrap();
+        assert_eq!(response["result"]["isError"], true);
+        assert!(response["result"]["content"][0]["text"]
+            .as_str().unwrap().contains("--allow-exec"));
+        assert_eq!(
+            response["result"]["_meta"]["rust-anything/tool-effects"]["process_execution"],
+            true
+        );
+    }
+
+    #[test]
+    fn mcp_exposes_capability_annotations_for_all_tools() {
+        let listed = tools();
+        let entries = listed.as_array().unwrap();
+        assert_eq!(entries.len(), 15);
+        let analyze = entries.iter().find(|tool| tool["name"] == "analyze").unwrap();
+        assert_eq!(analyze["annotations"]["readOnlyHint"], true);
+        let lift = entries.iter().find(|tool| tool["name"] == "app_lift").unwrap();
+        assert_eq!(lift["annotations"]["destructiveHint"], true);
+        let bridge = entries.iter().find(|tool| tool["name"] == "bridge").unwrap();
+        assert_eq!(bridge["annotations"]["openWorldHint"], true);
+    }
+
 }

@@ -37,13 +37,39 @@ These are in scope:
   matching the tagged source.
 - The MCP server doing more than the tool call asked for.
 
+## MCP tool authorization
+
+The stdio MCP server is **restricted by default**. Its working directory is
+the default allowed root (unless it is the home directory or filesystem
+root, in which case startup refuses to guess); repeatable `--root` arguments
+grant additional canonical directories. Direct `root`, `repo`, `crate`, `out`, `inputs`,
+`module`, `resolve_from` and `isolate_ro` path arguments cannot escape
+these roots (including via symlinks or parent traversal). Known generated
+output trees and manifest-resolved roots/source paths are also checked.
+
+Every MCP tool declares its read/write, process execution and destructive
+effects in descriptions, annotations and result metadata. Only `analyze`
+is read-only. All other tools can launch host processes (including formatter
+invocations by `bridge`, `refresh` and `shadow`) and require an operator
+`--allow-exec` grant at server startup. `app_lift` additionally requires
+`--allow-destructive`. Tool calls cannot grant these capabilities themselves.
+The explicit `--unrestricted` option restores legacy, unguarded MCP behavior.
+
+**This is not a kernel sandbox.** Authorized child processes run with host
+permissions and can read/write outside MCP roots, including through build
+scripts, tests, and shell commands. Symlink validation can race concurrent
+adversarial changes. Run untrusted code only with external OS isolation.
+Agent-host approval dialogs provide additional protection but are not a
+substitute for server-side authorization. Optional Linux Bubblewrap isolation
+for whole-app recording/replay is independent of MCP execution permission.
+
 ## Executing untrusted projects
 
 The default execution mode is **trusted host execution**. Commands that run original
 applications, test suites, builds or profilers (including unit `record`, `diff`,
 `profile`, `gate`, whole-app `app front-door`, `app wire` and `app lift`) have
-the invoking user's filesystem, network and environment permissions. MCP tools
-use those same permissions. A temporary working directory is not a sandbox.
+the invoking user's filesystem, network and environment permissions. MCP tools with explicit execution permission
+use those same host permissions. A temporary working directory is not a sandbox.
 Do not use these commands on untrusted source without an external VM/container.
 
 `app record` and `app replay` alone offer opt-in `--isolate` on **Linux** using

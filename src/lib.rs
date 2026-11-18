@@ -35,6 +35,7 @@ pub mod lang;
 pub mod library;
 pub mod lift;
 pub mod mcp;
+pub mod mcp_policy;
 pub mod profile;
 pub mod recording;
 pub mod resource_limits;

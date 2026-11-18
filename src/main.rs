@@ -18,7 +18,10 @@ macro_rules! say_raw {
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
-use rust_anything::{analyze, app, bridge, front_door, gate, harness, isolation, lift, mcp, report, shadow};
+use rust_anything::{
+    analyze, app, bridge, front_door, gate, harness, isolation, lift, mcp, mcp_policy, report,
+    shadow,
+};
 
 #[derive(Parser)]
 #[command(
@@ -235,8 +238,22 @@ enum Cmd {
         #[command(subcommand)]
         command: AppCmd,
     },
-    /// Serve every step as MCP tools over stdio.
-    Mcp,
+    /// Serve MCP tools with workspace path checks and denied execution by default.
+    Mcp {
+        /// Allowed workspace root. Repeat to explicitly grant more directories.
+        /// Defaults to the MCP process working directory.
+        #[arg(long = "root", value_name = "PATH")]
+        roots: Vec<PathBuf>,
+        /// Permit tools that launch host subprocesses (formatters, tests, builds, apps).
+        #[arg(long)]
+        allow_exec: bool,
+        /// Permit destructive operations such as app_lift (also requires --allow-exec).
+        #[arg(long, requires = "allow_exec")]
+        allow_destructive: bool,
+        /// Dangerous legacy mode: no MCP path or permission checks.
+        #[arg(long, conflicts_with_all = ["roots", "allow_exec", "allow_destructive"])]
+        unrestricted: bool,
+    },
     /// Register rust-anything with your coding agents (Claude Code, Codex, Cursor, Gemini CLI):
     /// the MCP server and, where the agent reads skills, the workflow skill. Keeps your other
     /// settings; run it again any time.
@@ -767,7 +784,17 @@ fn run() -> Result<ExitCode> {
             }
         }
         Cmd::App { command } => return run_app(command),
-        Cmd::Mcp => mcp::serve()?,
+        Cmd::Mcp {
+            roots,
+            allow_exec,
+            allow_destructive,
+            unrestricted,
+        } => mcp::serve_with_policy(mcp_policy::McpPolicy::new(
+            &roots,
+            allow_exec,
+            allow_destructive,
+            unrestricted,
+        )?)?,
         Cmd::Setup {
             agents,
             remove,

@@ -31,6 +31,10 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test
+      - name: MCP workspace and execution-policy regressions
+        run: |
+          cargo test --locked --lib mcp_policy::tests:: -- --nocapture
+          cargo test --locked --lib mcp::tests:: -- --nocapture
 
   resource-limits:
     runs-on: ubuntu-latest
@@ -123,6 +127,8 @@ jobs:
         run: cargo test --locked --lib app::tests::shell_words
       - name: Test process-tree termination (Windows)
         run: cargo test --locked --lib recorder_terminates_windows_subprocess_tree -- --nocapture
+      - name: MCP policy regressions on Windows
+        run: cargo test --locked --lib mcp_policy::tests:: -- --nocapture
       - name: Run native bridge integration tests
         run: cargo test --locked --test native -- --nocapture
 
