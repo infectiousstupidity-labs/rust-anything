@@ -42,7 +42,7 @@ impl Isolation {
             ensure!(
                 !matches!(
                     name,
-                    "PATH" | "HOME" | "TMPDIR" | "RUST_ANYTHING_FALLBACK_LOG" | "PORT"
+                    "PATH" | "HOME" | "PWD" | "TMPDIR" | "RUST_ANYTHING_FALLBACK_LOG" | "PORT"
                 ),
                 "isolation reserves environment variable {name}"
             );
@@ -208,7 +208,10 @@ impl Isolation {
             vars.extend(extra_env.iter().map(|(key, value)| (key.clone(), value.clone())));
             for (key, value) in vars {
                 ensure!(valid_env_name(&key), "invalid fixture environment key {key:?}");
-                if matches!(key.as_str(), "PATH" | "HOME" | "TMPDIR" | "RUST_ANYTHING_FALLBACK_LOG") {
+                if matches!(
+                    key.as_str(),
+                    "PATH" | "HOME" | "PWD" | "TMPDIR" | "RUST_ANYTHING_FALLBACK_LOG"
+                ) {
                     continue;
                 }
                 cmd.arg("--setenv").arg(key).arg(value);
@@ -218,6 +221,12 @@ impl Isolation {
                 "--setenv",
                 "RUST_ANYTHING_FALLBACK_LOG",
                 "/session/fallback.log",
+                "--setenv",
+                "PWD",
+                match workdir {
+                    Workdir::Work => "/session/cwd",
+                    Workdir::Project => "/project",
+                },
                 "--chdir",
                 match workdir {
                     Workdir::Work => "/session/cwd",
@@ -283,6 +292,7 @@ mod tests {
         assert!(Isolation::from_args(false, true, Vec::new(), &[]).is_err());
         assert!(Isolation::from_args(false, false, Vec::new(), &["X=1".into()]).is_err());
         assert!(Isolation::from_args(true, false, Vec::new(), &["PATH=/tmp".into()]).is_err());
+        assert!(Isolation::from_args(true, false, Vec::new(), &["PWD=/secret".into()]).is_err());
         assert!(Isolation::from_args(true, false, Vec::new(), &["BAD-NAME=1".into()]).is_err());
         let config =
             Isolation::from_args(true, false, Vec::new(), &["MY_FLAG=allowed".into()]).unwrap();
