@@ -124,6 +124,30 @@ pub fn cases_dir(repo: &Path) -> PathBuf {
     repo.join(CASES_DIR)
 }
 
+/// Do not accept a cases directory symlinked outside the selected project.
+fn checked_cases_dir(repo: &Path) -> Result<PathBuf> {
+    let root = repo
+        .canonicalize()
+        .with_context(|| format!("resolving repository {}", repo.display()))?;
+    let dir = cases_dir(&root);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(_) => {
+            let resolved = dir
+                .canonicalize()
+                .with_context(|| format!("resolving cases directory {}", dir.display()))?;
+            ensure!(
+                resolved.starts_with(&root) && resolved.is_dir(),
+                "{}: cases directory must be inside repository {}",
+                dir.display(),
+                root.display()
+            );
+            Ok(resolved)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(dir),
+        Err(err) => Err(err).with_context(|| format!("checking {}", dir.display())),
+    }
+}
+
 /// One line of an `--inputs` file.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1609,28 +1633,107 @@ struct Spec {
     stdout: Option<Vec<u8>>,
     stderr: Option<Vec<u8>>,
     status: Expect,
-    out_dir: Option<PathBuf>,
+    expected_files: Option<BTreeMap<PathBuf, Vec<u8>>>,
     binary: bool,
 }
 
-fn read_files(base: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
-    walk_files(base)
-        .into_iter()
-        .map(|p| {
-            let rel = p.strip_prefix(base).unwrap_or(&p).to_path_buf();
-            let bytes = std::fs::read(&p).unwrap_or_default();
-            (rel, bytes)
-        })
-        .collect()
+/// Resolve an existing fixture entry before reading it. A missing optional
+/// sidecar is permitted, but a dangling or escaping symlink is an error.
+fn fixture_entry(root: &Path, path: &Path, directory: bool) -> Result<Option<PathBuf>> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).with_context(|| format!("checking {}", path.display())),
+    }
+    let resolved = path
+        .canonicalize()
+        .with_context(|| format!("resolving fixture {}", path.display()))?;
+    ensure!(
+        resolved.starts_with(root),
+        "{}: fixture path escapes case directory {}",
+        path.display(),
+        root.display()
+    );
+    ensure!(
+        if directory {
+            resolved.is_dir()
+        } else {
+            resolved.is_file()
+        },
+        "{}: expected a regular {}",
+        path.display(),
+        if directory { "directory" } else { "file" }
+    );
+    Ok(Some(resolved))
+}
+
+fn fixture_relative(path: &str) -> bool {
+    let mut has_name = false;
+    for part in Path::new(path).components() {
+        match part {
+            Component::Normal(_) => has_name = true,
+            Component::CurDir => {}
+            _ => return false,
+        }
+    }
+    has_name
+}
+
+/// Read the input and expected-output snapshots without following nested symlinks.
+/// All paths are verified before any application process is started.
+fn read_fixture_files(root: &Path, base: &Path) -> Result<BTreeMap<PathBuf, Vec<u8>>> {
+    let mut files = BTreeMap::new();
+    let mut stack = vec![base.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .with_context(|| format!("reading fixture directory {}", dir.display()))?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let kind = entry.file_type()?;
+            ensure!(
+                !kind.is_symlink(),
+                "{}: symlinks are not allowed in fixture input/output trees",
+                path.display()
+            );
+            if kind.is_dir() {
+                let resolved = fixture_entry(root, &path, true)?
+                    .with_context(|| format!("fixture directory disappeared: {}", path.display()))?;
+                stack.push(resolved);
+            } else if kind.is_file() {
+                let resolved = fixture_entry(root, &path, false)?
+                    .with_context(|| format!("fixture file disappeared: {}", path.display()))?;
+                let relative = resolved
+                    .strip_prefix(base)
+                    .with_context(|| format!("{} is outside {}", resolved.display(), base.display()))?;
+                ensure!(
+                    relative.components().all(|c| matches!(c, Component::Normal(_))),
+                    "{}: invalid fixture file path",
+                    path.display()
+                );
+                let bytes = std::fs::read(&resolved)
+                    .with_context(|| format!("reading {}", resolved.display()))?;
+                files.insert(relative.to_path_buf(), bytes);
+            } else {
+                bail!("{}: unsupported fixture entry type", path.display());
+            }
+        }
+    }
+    Ok(files)
 }
 
 fn load_spec(dir: &Path, path: &Path) -> Result<Spec> {
+    let root = dir
+        .canonicalize()
+        .with_context(|| format!("resolving case directory {}", dir.display()))?;
+    let validated = fixture_entry(&root, path, false)?
+        .with_context(|| format!("missing fixture {}", path.display()))?;
     let name = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let text =
-        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text = std::fs::read_to_string(&validated)
+        .with_context(|| format!("reading {}", path.display()))?;
     let doc: DocumentMut = text
         .parse()
         .with_context(|| format!("parsing {}", path.display()))?;
@@ -1653,12 +1756,14 @@ fn load_spec(dir: &Path, path: &Path) -> Result<Spec> {
         if let Some(s) = doc.get(key).and_then(Item::as_str) {
             return Ok(Some(s.as_bytes().to_vec()));
         }
-        let file = dir.join(format!("{name}.{key}"));
-        Ok(if file.exists() {
-            Some(std::fs::read(&file).with_context(|| format!("reading {}", file.display()))?)
-        } else {
-            None
-        })
+        let file = root.join(format!("{name}.{key}"));
+        match fixture_entry(&root, &file, false)? {
+            Some(validated) => Ok(Some(
+                std::fs::read(&validated)
+                    .with_context(|| format!("reading {}", file.display()))?,
+            )),
+            None => Ok(None),
+        }
     };
     case.stdin = side("stdin")?;
     if let Some(env) = doc.get("env") {
@@ -1676,14 +1781,26 @@ fn load_spec(dir: &Path, path: &Path) -> Result<Spec> {
                 .collect();
         }
     }
-    let base = doc
+    let custom_base = doc
         .get("fs")
         .and_then(|f| f.get("base"))
-        .and_then(Item::as_str)
-        .map(|b| dir.join(b))
-        .unwrap_or_else(|| dir.join(format!("{name}.in")));
-    if base.is_dir() {
-        case.files = read_files(&base);
+        .and_then(Item::as_str);
+    if let Some(base) = custom_base {
+        ensure!(
+            fixture_relative(base),
+            "{}: fs.base must be a nonempty relative path without '..' or absolute components",
+            path.display()
+        );
+    }
+    let base = custom_base
+        .map(|base| root.join(base))
+        .unwrap_or_else(|| root.join(format!("{name}.in")));
+    match fixture_entry(&root, &base, true)? {
+        Some(validated) => case.files = read_fixture_files(&root, &validated)?,
+        None if custom_base.is_some() => {
+            bail!("{}: fs.base {} does not exist", path.display(), base.display());
+        }
+        None => {}
     }
     let status = match doc.get("status") {
         None => Expect::Code(0),
@@ -1696,12 +1813,16 @@ fn load_spec(dir: &Path, path: &Path) -> Result<Spec> {
             _ => bail!("{}: unknown `status`", path.display()),
         },
     };
-    let out_dir = dir.join(format!("{name}.out"));
+    let out_dir = root.join(format!("{name}.out"));
+    let expected_files = match fixture_entry(&root, &out_dir, true)? {
+        Some(validated) => Some(read_fixture_files(&root, &validated)?),
+        None => None,
+    };
     Ok(Spec {
         stdout: side("stdout")?,
         stderr: side("stderr")?,
         status,
-        out_dir: out_dir.is_dir().then_some(out_dir),
+        expected_files,
         binary: doc.get("binary").and_then(Item::as_bool).unwrap_or(false),
         name,
         case,
@@ -1857,8 +1978,8 @@ fn check(
             });
         }
     }
-    if let Some(out_dir) = &spec.out_dir {
-        for (path, expected) in read_files(out_dir) {
+    if let Some(expected_files) = &spec.expected_files {
+        for (path, expected) in expected_files {
             let field = format!("file {}", path.display());
             match run.files.get(&path) {
                 None => problems.push(Problem {
@@ -1976,7 +2097,7 @@ fn load_specs(dir: &Path) -> Result<Vec<Spec>> {
 
 /// The recorded cases' arguments, each with whether the original exited 0.
 pub(crate) fn recorded_args(repo: &Path) -> Result<Vec<(Vec<String>, bool)>> {
-    Ok(load_specs(&cases_dir(repo))?
+    Ok(load_specs(&checked_cases_dir(repo)?)?
         .into_iter()
         .map(|s| (s.case.args, matches!(s.status, Expect::Code(0))))
         .collect())
@@ -1987,7 +2108,7 @@ pub fn replay(opts: &ReplayOptions) -> Result<ReplayOutcome> {
         .repo
         .canonical()
         .with_context(|| format!("no folder {}", opts.repo.display()))?;
-    let dir = cases_dir(&repo);
+    let dir = checked_cases_dir(&repo)?;
     let config = Config::load(&repo)?;
     if config.is_none()
         && let Ok(state) = crate::front_door::State::load(&repo)
@@ -2082,6 +2203,106 @@ pub fn replay(opts: &ReplayOptions) -> Result<ReplayOutcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fixture_loader_accepts_generated_case_files_within_root() {
+        let root = temp_dir("fixture-local").unwrap();
+        let input = root.join("sample.in/nested");
+        let output = root.join("sample.out/nested");
+        std::fs::create_dir_all(&input).unwrap();
+        std::fs::create_dir_all(&output).unwrap();
+        std::fs::write(root.join("sample.toml"), "[fs]\nbase = 'sample.in'\n").unwrap();
+        std::fs::write(input.join("source.txt"), "local input").unwrap();
+        std::fs::write(output.join("result.txt"), "local output").unwrap();
+        std::fs::write(root.join("sample.stdin"), "local stdin").unwrap();
+        std::fs::write(root.join("sample.stdout"), "local stdout").unwrap();
+        std::fs::write(root.join("sample.stderr"), "local stderr").unwrap();
+
+        let loaded = load_spec(&root, &root.join("sample.toml")).unwrap();
+        assert_eq!(loaded.case.files[Path::new("nested/source.txt")], b"local input");
+        assert_eq!(
+            loaded.expected_files.as_ref().unwrap()[Path::new("nested/result.txt")],
+            b"local output"
+        );
+        assert_eq!(loaded.case.stdin.as_deref(), Some(&b"local stdin"[..]));
+        assert_eq!(loaded.stdout.as_deref(), Some(&b"local stdout"[..]));
+        assert_eq!(loaded.stderr.as_deref(), Some(&b"local stderr"[..]));
+
+        std::fs::write(root.join("sample.toml"), "").unwrap();
+        let implicit = load_spec(&root, &root.join("sample.toml")).unwrap();
+        assert_eq!(implicit.case.files, loaded.case.files);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fixture_loader_rejects_absolute_parent_and_missing_fs_base() {
+        let root = temp_dir("fixture-fs-base").unwrap();
+        let outside = root.with_extension("private");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("private.txt"), "DO-NOT-READ").unwrap();
+        let path = root.join("sample.toml");
+        let escapes = [
+            outside.to_string_lossy().into_owned(),
+            format!("../{}", outside.file_name().unwrap().to_string_lossy()),
+            format!("inside/../../{}", outside.file_name().unwrap().to_string_lossy()),
+            "does-not-exist".to_string(),
+            ".".to_string(),
+        ];
+        for base in escapes {
+            std::fs::write(&path, format!("[fs]\nbase = {base:?}\n")).unwrap();
+            let err = load_spec(&root, &path).err().unwrap().to_string();
+            assert!(err.contains("fs.base") || err.contains("fixture"), "{base}: {err}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fixture_loader_rejects_symlinked_inputs_outputs_and_sidecars() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_dir("fixture-links").unwrap();
+        let outside = root.with_extension("private");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("private.txt"), "DO-NOT-READ").unwrap();
+        let path = root.join("sample.toml");
+        std::fs::write(&path, "[fs]\nbase = 'sample.in'\n").unwrap();
+        symlink(&outside, root.join("sample.in")).unwrap();
+        assert!(load_spec(&root, &path).is_err());
+        std::fs::remove_file(root.join("sample.in")).unwrap();
+
+        std::fs::create_dir(root.join("sample.in")).unwrap();
+        symlink(outside.join("private.txt"), root.join("sample.in/link")).unwrap();
+        assert!(load_spec(&root, &path).is_err());
+        std::fs::remove_file(root.join("sample.in/link")).unwrap();
+
+        for suffix in ["stdin", "stdout", "stderr"] {
+            let sidecar = root.join(format!("sample.{suffix}"));
+            symlink(outside.join("private.txt"), &sidecar).unwrap();
+            let err = load_spec(&root, &path).err().unwrap().to_string();
+            assert!(err.contains("escapes"), "{suffix}: {err}");
+            std::fs::remove_file(sidecar).unwrap();
+        }
+
+        symlink(&outside, root.join("sample.out")).unwrap();
+        assert!(load_spec(&root, &path).is_err());
+        std::fs::remove_file(root.join("sample.out")).unwrap();
+
+        std::fs::create_dir(root.join("sample.out")).unwrap();
+        symlink(outside.join("private.txt"), root.join("sample.out/link")).unwrap();
+        assert!(load_spec(&root, &path).is_err());
+        std::fs::remove_file(root.join("sample.out/link")).unwrap();
+
+        let external_toml = outside.join("other.toml");
+        std::fs::write(&external_toml, "").unwrap();
+        let linked_case = root.join("external.toml");
+        symlink(&external_toml, &linked_case).unwrap();
+        assert!(load_spec(&root, &linked_case).is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_dir_all(outside).unwrap();
+    }
 
     #[test]
     fn reports_do_not_carry_sandbox_paths() {

@@ -315,6 +315,39 @@ fn front_door_then_wire(repo: &Path) {
 }
 
 #[test]
+fn replay_rejects_external_fixture_before_launching_build() {
+    let repo = fixture("ts");
+    let cases = app::cases_dir(&repo);
+    std::fs::create_dir_all(&cases).unwrap();
+    let outside = repo.with_extension("private");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(outside.join("marker.txt"), "DO-NOT-COPY").unwrap();
+    std::fs::write(
+        cases.join("unsafe.toml"),
+        format!("[fs]\nbase = {:?}\n", outside.to_string_lossy()),
+    )
+    .unwrap();
+
+    // A missing executable would be reached only if the unsafe fixture was
+    // accepted and replay attempted to run the original application.
+    let failure = app::replay(&ReplayOptions {
+        repo: &repo,
+        build: Some("rust-anything-missing-executable-for-boundary-test"),
+        timeout_secs: None,
+        port: None,
+        case: None,
+    })
+    .err()
+    .unwrap()
+    .to_string();
+    assert!(failure.contains("fs.base"), "{failure}");
+    assert!(outside.join("marker.txt").exists());
+
+    std::fs::remove_dir_all(repo).unwrap();
+    std::fs::remove_dir_all(outside).unwrap();
+}
+
+#[test]
 fn ts_cli_records_and_replays() {
     if !available("node", "--version") {
         eprintln!("skipped: node not found");

@@ -53,6 +53,25 @@ isolation. As with other path checks, concurrently modified filesystem trees are
 outside the protection guarantee; use immutable or isolated input checkouts for
 adversarial local writers.
 
+## Replay fixture filesystem boundary
+
+App replay treats \`rust/app-cases/\` as the fixture root inside the selected
+repository. An explicit TOML \`[fs] base\` must be a relative path inside that
+directory. Absolute paths and \`..\` components are rejected; canonicalized
+directories must remain inside the fixture root. The default \`<case>.in\`
+directory continues to work without an explicit setting.
+
+Companion \`<case>.stdin\`, \`<case>.stdout\`, \`<case>.stderr\` and
+\`<case>.out/\` paths receive the same canonical-root check before replay launches
+the application. Input/output snapshot trees reject nested symlinks rather than
+copying their targets. The fixture TOML and the cases directory itself must also
+resolve inside their expected roots. Invalid fixtures fail closed.
+
+These checks prevent static fixture path escapes; they are not a sandbox for the
+application being replayed. Concurrent adversarial filesystem modification can
+race path validation, so treat a writable shared checkout as untrusted and use
+OS isolation or an immutable checkout where needed.
+
 ## Disclosure
 
 Once a fix is released, the advisory is published with credit to the reporter, unless they prefer
